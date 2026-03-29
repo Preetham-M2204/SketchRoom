@@ -1,0 +1,119 @@
+# Project Documentation
+Instructions/
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.sublime-project
+.sublime-workspace
+*.code-workspace
+
+# Node & Package Management
+node_modules/
+npm-debug.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Environment Variables
+.env
+.env.local
+.env.*.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Build & Distribution
+dist/
+build/
+out/
+.next/
+.nuxt/
+.cache/
+.parcel-cache/
+coverage/
+.coverage/
+
+# Runtime & Logs
+logs/
+*.log
+*.log.*
+lerna-debug.log
+
+# OS Files
+Thumbs.db
+.DS_Store
+.AppleDouble
+.LSOverride
+*.swp
+*.swo
+*~
+
+# Database Files
+*.db
+*.sqlite
+*.sqlite3
+data/
+db/
+
+# Test Coverage
+.nyc_output/
+coverage/
+.coverage
+htmlcov/
+
+# Temporary Files
+tmp/
+temp/
+*.tmp
+
+# Backend-specific
+venv/
+env/
+ENV/
+.venv
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Frontend-specific
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+.eslintcache
+.stylelintcache
+
+# Development Tools
+.DS_Store
+.cache
+.vuepress/dist
+
+# Optional npm cache directory
+.npm
+
+# Lock files (if using npm workspaces, comment out as needed)
+# package-lock.json
+# yarn.lock
+# pnpm-lock.yaml
+
+# Misc
+.vscode-test
+*.vsix
+uploads/
+public/uploads/
