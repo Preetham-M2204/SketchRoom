@@ -1,27 +1,18 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 
-/**
- * CollaborativeCursors Component
- * Figma-style collaborative cursor overlay showing other users' cursors
- * in real-time with their name labels, unique colors, and tool indicators.
- *
- * Each cursor is an SVG arrow pointer with a colored label showing the user's name.
- * The cursors move smoothly with lerp-based animation.
- */
-
 const CURSOR_COLORS = [
-  '#D4420A', // Vermillion
-  '#1E5F74', // Teal
-  '#2A7A4B', // Green
-  '#7B4EA6', // Purple
-  '#C4871A', // Amber
-  '#C0392B', // Red
-  '#2980B9', // Blue
-  '#16A085', // Emerald
+  '#D4420A',
+  '#1E5F74',
+  '#2A7A4B',
+  '#7B4EA6',
+  '#C4871A',
+  '#C0392B',
+  '#2980B9',
+  '#16A085',
 ]
 
-function getCursorColor(userId) {
+function getCursorColor(userId = 'local-cursor') {
   let hash = 0
   for (let i = 0; i < userId.length; i++) {
     hash = userId.charCodeAt(i) + ((hash << 5) - hash)
@@ -42,8 +33,7 @@ const CursorArrow = ({ color }) => (
   </svg>
 )
 
-/* A single remote cursor with smooth lerp movement */
-const RemoteCursor = ({ user }) => {
+const RemoteCursor = ({ user, isSelf = false, variant = 'figma' }) => {
   const posRef = useRef({ x: user.x, y: user.y })
   const elmRef = useRef(null)
   const rafRef = useRef(null)
@@ -52,89 +42,133 @@ const RemoteCursor = ({ user }) => {
     const animate = () => {
       posRef.current.x += (user.x - posRef.current.x) * 0.2
       posRef.current.y += (user.y - posRef.current.y) * 0.2
+
       if (elmRef.current) {
         elmRef.current.style.transform = `translate(${posRef.current.x}px, ${posRef.current.y}px)`
       }
+
       rafRef.current = requestAnimationFrame(animate)
     }
+
     rafRef.current = requestAnimationFrame(animate)
-    return () => cancelAnimationFrame(rafRef.current)
+    return () => {
+      if (rafRef.current) {
+        cancelAnimationFrame(rafRef.current)
+      }
+    }
   }, [user.x, user.y])
 
   const color = getCursorColor(user.userId)
+  const label = isSelf ? 'You' : user.name
+
+  if (variant === 'minimal') {
+    return (
+      <div
+        ref={elmRef}
+        className="fixed top-0 left-0 pointer-events-none z-[650]"
+        style={{ willChange: 'transform' }}
+      >
+        <div className="relative">
+          <span
+            className="block w-3 h-3 rounded-full border-2 border-white shadow"
+            style={{ backgroundColor: color }}
+          />
+          <span
+            className="absolute left-4 -top-1 px-2 py-0.5 rounded-md text-white text-[10px] font-semibold whitespace-nowrap shadow-sm"
+            style={{ backgroundColor: color }}
+          >
+            {label}
+          </span>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div
       ref={elmRef}
-      className="fixed top-0 left-0 pointer-events-none z-[500]"
+      className="fixed top-0 left-0 pointer-events-none z-[650]"
       style={{ willChange: 'transform' }}
     >
-      {/* SVG cursor arrow */}
       <CursorArrow color={color} />
-
-      {/* Name label */}
       <div
         className="absolute left-4 top-4 px-2 py-0.5 rounded-md text-white text-[11px] font-semibold whitespace-nowrap shadow-sm"
         style={{ backgroundColor: color }}
       >
-        {user.name}
-        {user.tool && (
-          <span className="ml-1.5 opacity-70 text-[9px] uppercase">
-            {user.tool === 'pen' ? '/ Drawing' : user.tool === 'select' ? '' : `/ ${user.tool}`}
+        {label}
+        {user.tool ? (
+          <span className="ml-1.5 opacity-75 text-[9px] uppercase">
+            / {user.tool}
           </span>
-        )}
+        ) : null}
       </div>
     </div>
   )
 }
 
-/**
- * CollaborativeCursors
- *
- * Props:
- * - socket: Socket.io instance for broadcasting cursor positions
- * - roomId: current room ID
- * - userId: current user's ID
- * - userName: current user's display name
- * - activeTool: the current tool the user has selected (optional)
- *
- * Socket events:
- * - Emits 'cursor:move' with { x, y, userId, name, tool }
- * - Listens to 'cursor:update' from other users
- */
-const CollaborativeCursors = ({ socket, roomId, userId, userName, activeTool }) => {
+const CollaborativeCursors = ({
+  socket,
+  roomId,
+  userId,
+  userName,
+  activeTool,
+  showLocalCursor = true,
+  variant = 'figma',
+}) => {
   const [remoteCursors, setRemoteCursors] = useState({})
+  const [localCursor, setLocalCursor] = useState(null)
   const throttleRef = useRef(null)
+  const lastClientRef = useRef({ x: 0, y: 0 })
 
-  // Emit local cursor position
-  const handleMouseMove = useCallback(
-    (e) => {
-      if (!socket || !roomId) return
+  const updateCursor = useCallback(
+    ({ x, y, emitSocket = true }) => {
+      lastClientRef.current = { x, y }
 
-      // Throttle to ~30fps
+      const payload = {
+        roomId,
+        userId,
+        name: userName || 'Anonymous',
+        x,
+        y,
+        tool: activeTool || 'select',
+      }
+
+      if (showLocalCursor && userId) {
+        setLocalCursor({
+          ...payload,
+          lastSeen: Date.now(),
+        })
+      }
+
+      if (!socket || !roomId || !userId) return
+      if (!emitSocket) return
+
       if (throttleRef.current) return
       throttleRef.current = setTimeout(() => {
         throttleRef.current = null
       }, 33)
 
-      socket.emit('cursor:move', {
-        roomId,
-        userId,
-        name: userName || 'Anonymous',
-        x: e.clientX,
-        y: e.clientY,
-        tool: activeTool || 'select',
-      })
+      socket.emit('cursor:move', payload)
     },
-    [socket, roomId, userId, userName, activeTool]
+    [socket, roomId, userId, userName, activeTool, showLocalCursor]
   )
 
-  // Listen for remote cursors
+  const handlePointerMove = useCallback(
+    (event) => {
+      updateCursor({
+        x: event.clientX,
+        y: event.clientY,
+      })
+    },
+    [updateCursor]
+  )
+
   useEffect(() => {
     if (!socket) return
 
     const handleCursorUpdate = (data) => {
-      if (data.userId === userId) return
+      if (!data?.userId || data.userId === userId) return
+
       setRemoteCursors((prev) => ({
         ...prev,
         [data.userId]: {
@@ -146,9 +180,9 @@ const CollaborativeCursors = ({ socket, roomId, userId, userName, activeTool }) 
 
     const handleCursorLeave = ({ userId: leftUserId }) => {
       setRemoteCursors((prev) => {
-        const copy = { ...prev }
-        delete copy[leftUserId]
-        return copy
+        const next = { ...prev }
+        delete next[leftUserId]
+        return next
       })
     }
 
@@ -161,13 +195,28 @@ const CollaborativeCursors = ({ socket, roomId, userId, userName, activeTool }) 
     }
   }, [socket, userId])
 
-  // Attach mouse move listener
   useEffect(() => {
-    document.addEventListener('mousemove', handleMouseMove)
-    return () => document.removeEventListener('mousemove', handleMouseMove)
-  }, [handleMouseMove])
+    document.addEventListener('pointermove', handlePointerMove)
 
-  // Clean up stale cursors (>5s without update)
+    const handleViewportInteraction = () => {
+      const { x, y } = lastClientRef.current
+      if (x || y) {
+        updateCursor({ x, y, emitSocket: false })
+      }
+    }
+
+    document.addEventListener('wheel', handleViewportInteraction, { passive: true })
+
+    return () => {
+      document.removeEventListener('pointermove', handlePointerMove)
+      document.removeEventListener('wheel', handleViewportInteraction)
+      if (throttleRef.current) {
+        clearTimeout(throttleRef.current)
+        throttleRef.current = null
+      }
+    }
+  }, [handlePointerMove, updateCursor])
+
   useEffect(() => {
     const interval = setInterval(() => {
       const now = Date.now()
@@ -181,61 +230,41 @@ const CollaborativeCursors = ({ socket, roomId, userId, userName, activeTool }) 
         return cleaned
       })
     }, 2000)
+
     return () => clearInterval(interval)
   }, [])
 
-  // For demo: show mock collaborative cursors when no socket
-  const [demoMode] = useState(!socket)
-  const [demoCursors, setDemoCursors] = useState({})
+  const hasFinePointer =
+    typeof window === 'undefined' ? true : window.matchMedia('(pointer:fine)').matches
 
-  useEffect(() => {
-    if (!demoMode) return
-
-    // Simulate two other users with animated cursor positions
-    let frame = 0
-    const loop = () => {
-      frame++
-      const t = frame / 60
-
-      setDemoCursors({
-        'demo-sarah': {
-          userId: 'demo-sarah',
-          name: 'Sarah L.',
-          x: 300 + Math.sin(t * 0.7) * 150,
-          y: 250 + Math.cos(t * 0.5) * 100,
-          tool: 'pen',
-          lastSeen: Date.now(),
-        },
-        'demo-marcus': {
-          userId: 'demo-marcus',
-          name: 'Marcus T.',
-          x: 600 + Math.cos(t * 0.4) * 120,
-          y: 400 + Math.sin(t * 0.6) * 80,
-          tool: 'select',
-          lastSeen: Date.now(),
-        },
-      })
-
-      return requestAnimationFrame(loop)
-    }
-    const id = requestAnimationFrame(loop)
-    return () => cancelAnimationFrame(id)
-  }, [demoMode])
-
-  const cursorsToRender = demoMode ? demoCursors : remoteCursors
+  if (!hasFinePointer) {
+    return null
+  }
 
   return (
-    <div className="fixed inset-0 pointer-events-none z-[500]" aria-hidden="true">
+    <div className="fixed inset-0 pointer-events-none z-[640]" aria-hidden="true">
       <AnimatePresence>
-        {Object.values(cursorsToRender).map((cursor) => (
+        {showLocalCursor && localCursor ? (
+          <motion.div
+            key="local-cursor"
+            initial={{ opacity: 0, scale: 0.8 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.8 }}
+            transition={{ duration: 0.12 }}
+          >
+            <RemoteCursor user={localCursor} isSelf variant={variant} />
+          </motion.div>
+        ) : null}
+
+        {Object.values(remoteCursors).map((cursor) => (
           <motion.div
             key={cursor.userId}
-            initial={{ opacity: 0, scale: 0.5 }}
+            initial={{ opacity: 0, scale: 0.6 }}
             animate={{ opacity: 1, scale: 1 }}
-            exit={{ opacity: 0, scale: 0.5 }}
-            transition={{ duration: 0.2 }}
+            exit={{ opacity: 0, scale: 0.6 }}
+            transition={{ duration: 0.15 }}
           >
-            <RemoteCursor user={cursor} />
+            <RemoteCursor user={cursor} variant={variant} />
           </motion.div>
         ))}
       </AnimatePresence>

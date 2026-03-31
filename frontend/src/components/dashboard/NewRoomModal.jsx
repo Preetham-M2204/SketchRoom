@@ -92,7 +92,7 @@ const NewRoomModal = ({ isOpen, onClose }) => {
 
       toast.success('Room created successfully!')
       onClose()
-      navigate(`/room/${room.id}`)
+      navigate(`/room/${room.publicId || room.id}`)
     } catch (error) {
       toast.error(error.message || 'Failed to create room')
     } finally {

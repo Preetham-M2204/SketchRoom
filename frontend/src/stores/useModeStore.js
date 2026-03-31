@@ -22,11 +22,21 @@ const useModeStore = create((set) => ({
     currentSpeakerIndex: 0,
     speakers: [], // [{ userId, name, timeRemaining, hasSpoken }]
     scores: {}, // { userId: { clarity: 5, content: 4, ... } }
+    micOverrideUserIds: [],
     isActive: false,
     summary: null, // AI-generated summary from Claude
   },
 
   // Decision Board Actions
+  setDecisionState: (decisionState) => set((state) => ({
+    decision: {
+      ...state.decision,
+      phase: decisionState?.phase || 'brainstorm',
+      items: Array.isArray(decisionState?.items) ? decisionState.items : [],
+      analysis: decisionState?.analysis || null,
+    },
+  })),
+
   setDecisionPhase: (phase) => set((state) => ({
     decision: { ...state.decision, phase },
   })),
@@ -34,7 +44,9 @@ const useModeStore = create((set) => ({
   addDecisionItem: (item) => set((state) => ({
     decision: {
       ...state.decision,
-      items: [...state.decision.items, item],
+      items: state.decision.items.some((entry) => entry.id === item.id)
+        ? state.decision.items
+        : [...state.decision.items, item],
     },
   })),
 
@@ -50,7 +62,10 @@ const useModeStore = create((set) => ({
       ...state.decision,
       items: state.decision.items.map(item =>
         item.id === itemId
-          ? { ...item, votes: [...item.votes, userId] }
+          ? {
+              ...item,
+              votes: item.votes.includes(userId) ? item.votes : [...item.votes, userId],
+            }
           : item
       ),
     },
@@ -69,6 +84,21 @@ const useModeStore = create((set) => ({
   }),
 
   // Meeting Room Actions
+  setMeetingState: (meetingState) => set((state) => ({
+    meeting: {
+      ...state.meeting,
+      presenter: meetingState?.presenter || null,
+      agenda: Array.isArray(meetingState?.agenda) ? meetingState.agenda : [],
+      handQueue: Array.isArray(meetingState?.handQueue)
+        ? [...new Set(meetingState.handQueue)]
+        : [],
+      currentAgendaIndex: Number.isFinite(meetingState?.currentAgendaIndex)
+        ? meetingState.currentAgendaIndex
+        : 0,
+      isViewportSynced: Boolean(meetingState?.isViewportSynced),
+    },
+  })),
+
   setPresenter: (userId) => set((state) => ({
     meeting: { ...state.meeting, presenter: userId },
   })),
@@ -80,7 +110,9 @@ const useModeStore = create((set) => ({
   addToHandQueue: (userId) => set((state) => ({
     meeting: {
       ...state.meeting,
-      handQueue: [...state.meeting.handQueue, userId],
+      handQueue: state.meeting.handQueue.includes(userId)
+        ? state.meeting.handQueue
+        : [...state.meeting.handQueue, userId],
     },
   })),
 
@@ -113,6 +145,25 @@ const useModeStore = create((set) => ({
   }),
 
   // GD Round Actions
+  setGdState: (gdState) => set((state) => ({
+    gd: {
+      ...state.gd,
+      currentSpeakerIndex: Number.isFinite(gdState?.currentSpeakerIndex)
+        ? gdState.currentSpeakerIndex
+        : 0,
+      speakers: Array.isArray(gdState?.speakers) ? gdState.speakers : [],
+      scores:
+        gdState?.scores && typeof gdState.scores === 'object'
+          ? gdState.scores
+          : {},
+      micOverrideUserIds: Array.isArray(gdState?.micOverrideUserIds)
+        ? [...new Set(gdState.micOverrideUserIds.map((value) => String(value)))]
+        : [],
+      isActive: Boolean(gdState?.isActive),
+      summary: gdState?.summary || null,
+    },
+  })),
+
   setSpeakers: (speakers) => set((state) => ({
     gd: { ...state.gd, speakers },
   })),
@@ -152,6 +203,7 @@ const useModeStore = create((set) => ({
       currentSpeakerIndex: 0,
       speakers: [],
       scores: {},
+      micOverrideUserIds: [],
       isActive: false,
       summary: null,
     },
@@ -175,6 +227,7 @@ const useModeStore = create((set) => ({
       currentSpeakerIndex: 0,
       speakers: [],
       scores: {},
+      micOverrideUserIds: [],
       isActive: false,
       summary: null,
     },

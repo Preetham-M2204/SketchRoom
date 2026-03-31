@@ -1,11 +1,13 @@
 import { useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { login, bypassLogin } from '../api/auth'
 import { toast } from '../components/ui/Toast'
 import CustomCursor from '../components/ui/CustomCursor'
 
 const Login = () => {
   const navigate = useNavigate()
+  const location = useLocation()
+  const redirectPath = new URLSearchParams(location.search).get('redirect') || '/dashboard'
   const [formData, setFormData] = useState({
     email: '',
     password: '',
@@ -44,7 +46,7 @@ const Login = () => {
     try {
       await login(formData)
       toast.success('Welcome back!')
-      navigate('/dashboard')
+      navigate(redirectPath)
     } catch (error) {
       toast.error(error.message || 'Login failed. Please try again.')
       setErrors({ password: 'Invalid email or password' })
@@ -56,7 +58,7 @@ const Login = () => {
   const handleBypass = () => {
     bypassLogin()
     toast.success('Testing bypass enabled')
-    navigate('/dashboard')
+    navigate(redirectPath)
   }
 
   return (

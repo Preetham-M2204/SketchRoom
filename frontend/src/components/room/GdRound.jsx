@@ -1,282 +1,928 @@
-import { useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { motion, AnimatePresence } from 'framer-motion'
+import { buildRoomShareLink, copyTextToClipboard, isLocalShareOrigin } from '../../api/rooms'
 import useGdRound from '../../hooks/useGdRound'
+import useRoomStore from '../../stores/useRoomStore'
+import { toast } from '../ui/Toast'
+import JoinRequestsMenu from '../layout/JoinRequestsMenu'
 
-/**
- * GdRound Component
- * Matches Stitch design: 4 dashed speaker zones, circular timer ring,
- * right scoring panel, bottom speaker bar — fully responsive
- */
+function formatSeconds(totalSeconds = 0) {
+  const safe = Math.max(0, Number(totalSeconds) || 0)
+  const mins = Math.floor(safe / 60)
+  const secs = safe % 60
+  return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`
+}
 
-const ZONES = [
-  { id: 'alpha', user: 'Marcus', color: '#D4420A' },
-  { id: 'beta', user: 'Elena', color: '#1E5F74' },
-  { id: 'gamma', user: 'Sarah', color: '#2A7A4B' },
-  { id: 'delta', user: 'Ken', color: '#C0392B' },
+function computeAverageScore(scoreMap = {}) {
+  const values = Object.values(scoreMap).filter((value) => Number.isFinite(value))
+  if (!values.length) return null
+  return values.reduce((sum, value) => sum + value, 0) / values.length
+}
+
+const SCORE_FIELDS = [
+  { key: 'clarity', label: 'Clarity' },
+  { key: 'relevance', label: 'Relevance' },
+  { key: 'confidence', label: 'Confidence' },
 ]
 
-const GdRound = ({ socket, roomId, userId, room }) => {
+const ROUND_TABLE_SEAT_COLORS = [
+  '#D4420A',
+  '#1E5F74',
+  '#2A7A4B',
+  '#A65A2A',
+  '#7B4EA6',
+  '#C4871A',
+  '#C0392B',
+  '#2980B9',
+]
+
+const MAX_ROUND_TABLE_SEATS = 10
+
+function getInitials(name = 'Member') {
+  const parts = String(name).trim().split(/\s+/).filter(Boolean)
+  if (!parts.length) return 'M'
+  return parts
+    .slice(0, 2)
+    .map((part) => part.charAt(0).toUpperCase())
+    .join('')
+}
+
+function getMediaUnsupportedMessage(featureLabel) {
+  const hostname = typeof window !== 'undefined' ? window.location?.hostname || '' : ''
+  const isLocalhost = hostname === 'localhost' || hostname === '127.0.0.1'
+  const isSecure = typeof window !== 'undefined' ? Boolean(window.isSecureContext) : false
+
+  if (!isSecure && !isLocalhost) {
+    return `${featureLabel} needs HTTPS or localhost. Open the app on https://... or http://localhost.`
+  }
+
+  return `${featureLabel} is unavailable in this browser/environment. Use latest Chrome, Edge, or Firefox.`
+}
+
+const GdRound = ({ socket, roomId, userId, room, requestsMenu = null }) => {
   const navigate = useNavigate()
+  const normalizedUserId = String(userId || '')
+  const isHost = String(room?.owner?.id || '') === normalizedUserId
+  const viewerRole = room?.permissions?.viewerRole || (isHost ? 'owner' : 'member')
+  const canModerate = viewerRole === 'owner' || viewerRole === 'moderator'
+
   const {
     speakers,
     currentSpeaker,
     currentSpeakerIndex,
     scores,
+    micOverrideUserIds,
     isActive,
     summary,
-    isModerator,
+    isLoading,
+    isMutating,
     startRound,
     nextSpeaker,
+    submitScore,
+    setSpeakerMicAccess,
     endRound,
-  } = useGdRound(socket, roomId, userId)
+  } = useGdRound(socket, roomId, userId, viewerRole)
 
-  const [timerSeconds] = useState(45)
-  const [judgeNotes, setJudgeNotes] = useState('')
+  const members = useRoomStore((state) => state.members)
 
-  const formatTime = (seconds) => {
-    const mins = Math.floor(seconds / 60)
-    const secs = seconds % 60
-    return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`
+  const [showPanel, setShowPanel] = useState(() => {
+    if (typeof window === 'undefined') return true
+    return window.innerWidth >= 1024
+  })
+  const [selectedSpeakerId, setSelectedSpeakerId] = useState('')
+  const [scoreDraft, setScoreDraft] = useState({
+    clarity: 7,
+    relevance: 7,
+    confidence: 7,
+  })
+  const [isMicOn, setIsMicOn] = useState(false)
+  const [isMicBusy, setIsMicBusy] = useState(false)
+  const localMicStreamRef = useRef(null)
+
+  const participantList = useMemo(() => {
+    const map = new Map()
+    const hostId = String(room?.owner?.id || '')
+
+    ;(room?.members || []).forEach((member) => {
+      const id = String(member?.id || member?.userId || '')
+      if (!id || id === hostId) return
+      map.set(id, { id, name: member?.name || 'Member' })
+    })
+
+    ;(members || []).forEach((member) => {
+      const id = String(member?.userId || member?.id || '')
+      if (!id || id === hostId) return
+      map.set(id, { id, name: member?.name || 'Member' })
+    })
+
+    if (userId && String(userId) !== hostId && !map.has(String(userId))) {
+      map.set(String(userId), { id: String(userId), name: 'You' })
+    }
+
+    return Array.from(map.values())
+  }, [room?.members, room?.owner?.id, members, userId])
+
+  const { roundTableParticipants, roundTableOverflowCount } = useMemo(() => {
+    const source =
+      speakers.length > 0
+        ? speakers.map((speaker) => ({
+            id: String(speaker.userId || ''),
+            name: speaker.name || 'Speaker',
+            timeRemaining: Number(speaker.timeRemaining) || 0,
+          }))
+        : participantList.map((participant) => ({
+            id: String(participant.id || ''),
+            name: participant.name || 'Member',
+            timeRemaining: null,
+          }))
+
+    const deduped = []
+    const seen = new Set()
+
+    source.forEach((participant) => {
+      if (!participant.id || seen.has(participant.id)) return
+      seen.add(participant.id)
+      deduped.push(participant)
+    })
+
+    return {
+      roundTableParticipants: deduped.slice(0, MAX_ROUND_TABLE_SEATS),
+      roundTableOverflowCount: Math.max(0, deduped.length - MAX_ROUND_TABLE_SEATS),
+    }
+  }, [speakers, participantList])
+
+  const roundTableSeats = useMemo(() => {
+    const count = roundTableParticipants.length
+    if (!count) return []
+
+    const radius =
+      count <= 4
+        ? 86
+        : count <= 6
+          ? 98
+          : count <= 8
+            ? 110
+            : 120
+
+    return roundTableParticipants.map((participant, index) => {
+      const angle = (Math.PI * 2 * index) / count - Math.PI / 2
+      const average = computeAverageScore(scores?.[participant.id] || {})
+
+      return {
+        ...participant,
+        color: ROUND_TABLE_SEAT_COLORS[index % ROUND_TABLE_SEAT_COLORS.length],
+        x: Math.cos(angle) * radius,
+        y: Math.sin(angle) * radius,
+        isCurrent: String(currentSpeaker?.userId || '') === participant.id,
+        isSelected: String(selectedSpeakerId || '') === participant.id,
+        averageLabel: average === null ? null : average.toFixed(1),
+      }
+    })
+  }, [roundTableParticipants, scores, currentSpeaker?.userId, selectedSpeakerId])
+
+  const focusedSeat = useMemo(() => {
+    return (
+      roundTableSeats.find((seat) => seat.isCurrent) ||
+      roundTableSeats.find((seat) => seat.isSelected) ||
+      null
+    )
+  }, [roundTableSeats])
+
+  useEffect(() => {
+    if (currentSpeaker?.userId) {
+      setSelectedSpeakerId(currentSpeaker.userId)
+    }
+  }, [currentSpeaker?.userId])
+
+  const selectedScoreTarget = useMemo(() => {
+    if (!selectedSpeakerId) return null
+    return speakers.find((speaker) => speaker.userId === selectedSpeakerId) || null
+  }, [speakers, selectedSpeakerId])
+
+  const roundBaselineSeconds = useMemo(() => {
+    const fromSpeakers = speakers
+      .map((speaker) => Number(speaker?.timeRemaining || 0))
+      .filter((value) => Number.isFinite(value) && value > 0)
+    if (!fromSpeakers.length) return 120
+    return Math.max(120, ...fromSpeakers)
+  }, [speakers])
+
+  const currentSpeakerProgress = useMemo(() => {
+    if (!currentSpeaker) return 0
+    const remaining = Math.max(0, Number(currentSpeaker.timeRemaining) || 0)
+    return Math.min(100, Math.max(0, Math.round((remaining / roundBaselineSeconds) * 100)))
+  }, [currentSpeaker, roundBaselineSeconds])
+
+  const micOverrideSet = useMemo(() => {
+    return new Set((micOverrideUserIds || []).map((value) => String(value)))
+  }, [micOverrideUserIds])
+
+  const currentSpeakerUserId = String(currentSpeaker?.userId || '')
+
+  const canSpeakNow = useMemo(() => {
+    if (canModerate) return true
+    if (!normalizedUserId) return false
+    if (micOverrideSet.has(normalizedUserId)) return true
+    return isActive && currentSpeakerUserId === normalizedUserId
+  }, [canModerate, normalizedUserId, micOverrideSet, isActive, currentSpeakerUserId])
+
+  const canViewSummary = isHost
+
+  const speakerLeaderboard = useMemo(() => {
+    return [...speakers]
+      .map((speaker) => {
+        const average = computeAverageScore(scores?.[speaker.userId] || {})
+        return {
+          ...speaker,
+          average,
+          averageLabel: average === null ? 'N/A' : average.toFixed(2),
+          averagePercent: average === null ? 0 : Math.round((average / 10) * 100),
+        }
+      })
+      .sort((a, b) => (b.average ?? -1) - (a.average ?? -1))
+  }, [speakers, scores])
+
+  const scoreInsights = useMemo(() => {
+    const ranked = speakerLeaderboard.filter((entry) => entry.average !== null)
+    if (!ranked.length) return []
+
+    const top = ranked[0]
+    const low = ranked[ranked.length - 1]
+    const insights = [`Top performer: ${top.name}`]
+
+    if (ranked.length > 1) {
+      insights.push(`Needs boost: ${low.name}`)
+      insights.push(`Score spread: ${(top.average - low.average).toFixed(2)}`)
+    }
+
+    if (ranked.length >= 3) {
+      insights.push('Good sample size for fair panel ranking')
+    }
+
+    return insights
+  }, [speakerLeaderboard])
+
+  const coachPrompts = useMemo(() => {
+    if (!currentSpeaker) {
+      return [
+        'Start with a strong opening statement in under 20 seconds.',
+        'Use one concrete example to anchor your argument.',
+        'Close with a crisp one-line summary.',
+      ]
+    }
+
+    return [
+      `Ask ${currentSpeaker.name} to add one measurable outcome to the argument.`,
+      `Challenge ${currentSpeaker.name} with a 15-second counterpoint drill.`,
+      `Prompt ${currentSpeaker.name} to conclude with a single memorable line.`,
+    ]
+  }, [currentSpeaker])
+
+  const stopLocalMic = useCallback(() => {
+    if (localMicStreamRef.current) {
+      localMicStreamRef.current.getTracks().forEach((track) => track.stop())
+      localMicStreamRef.current = null
+    }
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      stopLocalMic()
+    }
+  }, [stopLocalMic])
+
+  useEffect(() => {
+    if (canSpeakNow || !isMicOn) return
+
+    stopLocalMic()
+    setIsMicOn(false)
+    toast.warning('Mic disabled until your turn or moderator override')
+  }, [canSpeakNow, isMicOn, stopLocalMic])
+
+  const handleToggleMyMic = async () => {
+    if (isMicOn) {
+      stopLocalMic()
+      setIsMicOn(false)
+      toast.success('Mic muted')
+      return
+    }
+
+    if (!canSpeakNow) {
+      toast.warning('Wait for your turn or moderator mic access')
+      return
+    }
+
+    if (!navigator?.mediaDevices?.getUserMedia) {
+      toast.error(getMediaUnsupportedMessage('Microphone access'))
+      return
+    }
+
+    setIsMicBusy(true)
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: false,
+      })
+
+      stopLocalMic()
+      localMicStreamRef.current = stream
+      setIsMicOn(true)
+      toast.success('Mic enabled')
+    } catch (error) {
+      if (error?.name === 'NotAllowedError' || error?.name === 'SecurityError') {
+        toast.error('Microphone permission was blocked. Allow mic access in browser settings.')
+      } else if (error?.name === 'NotFoundError') {
+        toast.error('No microphone device found on this system.')
+      } else {
+        toast.error('Unable to access microphone. Check browser permissions.')
+      }
+    } finally {
+      setIsMicBusy(false)
+    }
   }
 
-  // Timer ring calculation
-  const timerProgress = (45 - timerSeconds) / 45
-  const circumference = 2 * Math.PI * 52
-  const dashOffset = circumference * (1 - timerProgress)
+  const handleToggleSpeakerMicAccess = async (targetUserId) => {
+    if (!canModerate) {
+      toast.warning('Only host or moderator can control mic access')
+      return
+    }
+
+    const normalizedTargetId = String(targetUserId || '')
+    if (!normalizedTargetId) return
+
+    if (normalizedTargetId === currentSpeakerUserId) {
+      toast.info('Current speaker already has mic access')
+      return
+    }
+
+    const nextEnabled = !micOverrideSet.has(normalizedTargetId)
+
+    try {
+      await setSpeakerMicAccess(normalizedTargetId, nextEnabled)
+      toast.success(nextEnabled ? 'Mic access granted' : 'Mic access revoked')
+    } catch {
+      // Error toast handled in hook.
+    }
+  }
+
+  const handleStartRound = async () => {
+    if (!canModerate) {
+      toast.warning('Only host or moderator can start the GD round')
+      return
+    }
+
+    const source = participantList.length > 0 ? participantList : [{ id: String(userId), name: 'You' }]
+    const speakerList = source.map((participant) => ({
+      userId: participant.id,
+      name: participant.name,
+      timeRemaining: 120,
+      hasSpoken: false,
+    }))
+
+    try {
+      await startRound(speakerList)
+      toast.success('GD round started')
+    } catch {
+      // Error toast handled in hook.
+    }
+  }
+
+  const handleNextSpeaker = async () => {
+    if (!canModerate) {
+      toast.warning('Only host or moderator can advance speakers')
+      return
+    }
+
+    try {
+      const nextState = await nextSpeaker()
+      if (!nextState && isActive) {
+        await handleEndRound()
+      }
+    } catch {
+      // Error toast handled in hook.
+    }
+  }
+
+  const handleSubmitScore = async () => {
+    if (!canModerate) {
+      toast.warning('Only host or moderator can submit scores')
+      return
+    }
+
+    if (!selectedSpeakerId) {
+      toast.warning('Select a speaker first')
+      return
+    }
+
+    try {
+      await submitScore(selectedSpeakerId, scoreDraft)
+      toast.success('Score submitted')
+    } catch {
+      // Error toast handled in hook.
+    }
+  }
+
+  const handleEndRound = async () => {
+    if (!canModerate) {
+      toast.warning('Only host or moderator can end the GD round')
+      return
+    }
+
+    try {
+      await endRound()
+      toast.success('GD round ended')
+    } catch {
+      // Error toast handled in hook.
+    }
+  }
+
+  const handleShare = async () => {
+    if (!isHost) {
+      toast.warning('Only the host can invite guests to this room')
+      return
+    }
+
+    const roomUrl = buildRoomShareLink(room)
+    if (!roomUrl) {
+      toast.error('Share link is unavailable for this room')
+      return
+    }
+
+    const roomCode = room?.publicId || room?.inviteCode || room?.id
+    const localOriginTip = isLocalShareOrigin() && !import.meta.env.VITE_SHARE_BASE_URL
+      ? '\nTip: Set VITE_SHARE_BASE_URL to your LAN URL for cross-device same-network access.'
+      : ''
+
+    const shareText = `Join my SketchRoom GD room\nRoom: ${roomUrl}${roomCode ? `\nRoom code: ${roomCode}` : ''}\nAdmins need to approve join requests.${localOriginTip}`
+
+    const copied = await copyTextToClipboard(shareText)
+    if (copied) {
+      toast.success('Invite copied to clipboard')
+      return
+    }
+
+    toast.error('Could not copy invite details')
+  }
 
   return (
-    <div className="h-screen w-screen flex flex-col bg-[#fdf9f1] font-body overflow-hidden">
-      {/* ━━ Header ━━ */}
-      <header className="h-[48px] bg-[#2C2C28] px-4 sm:px-6 flex items-center justify-between shrink-0">
-        <div className="flex items-center gap-3">
-          <button onClick={() => navigate('/dashboard')} className="text-[#EDE9E0]/60 hover:text-[#EDE9E0]">
+    <div className="h-screen w-screen flex flex-col bg-[#F7F4EF] font-body overflow-hidden">
+      <header className="min-h-[52px] bg-[#2C2C28] px-3 sm:px-6 py-2 flex flex-wrap items-center justify-between gap-2 shrink-0">
+        <div className="flex items-center gap-2 sm:gap-3 min-w-0 flex-1">
+          <button
+            onClick={() => navigate('/dashboard')}
+            className="text-[#EDE9E0]/65 hover:text-[#EDE9E0] shrink-0"
+          >
             <span className="material-symbols-outlined text-[20px]">arrow_back</span>
           </button>
-          <h1 className="text-[15px] sm:text-[17px] font-bold text-[#EDE9E0] uppercase tracking-wide">Collaborative Canvas</h1>
-          <span className="hidden sm:inline-flex px-2.5 py-[2px] text-[10px] font-bold tracking-wider text-white bg-[#2A7A4B] rounded-full uppercase">
-            GD Round Mode
-          </span>
+
+          <div className="min-w-0">
+            <h1 className="text-[14px] sm:text-[15px] font-semibold text-[#EDE9E0] truncate">
+              {room?.name || 'GD Round Room'}
+            </h1>
+            <p className="text-[11px] text-[#EDE9E0]/55 truncate">
+              Backend-driven GD flow with persistent scores and summary
+            </p>
+          </div>
         </div>
 
-        <nav className="hidden sm:flex items-center gap-1">
-          {['Canvas', 'Timeline', 'History'].map((tab, i) => (
-            <a key={tab} href="#" className={`px-3 py-1 text-[13px] font-medium ${i === 0 ? 'text-[#D4420A] border-b-2 border-[#D4420A]' : 'text-[#EDE9E0]/50'}`}>
-              {tab}
-            </a>
-          ))}
-        </nav>
+        <div className="flex items-center justify-end gap-2 w-full sm:w-auto">
+          <button
+            onClick={() => setShowPanel((previous) => !previous)}
+            className="lg:hidden px-2.5 py-1.5 rounded-md bg-[#EDE9E0]/10 text-[#EDE9E0] text-[11px] font-semibold"
+          >
+            {showPanel ? 'Hide Panel' : 'Panel'}
+          </button>
 
-        <div className="flex items-center gap-2">
-          <button className="text-[#EDE9E0]/50 hover:text-[#EDE9E0] p-1"><span className="material-symbols-outlined text-[20px]">help</span></button>
-          <button className="text-[#EDE9E0]/50 hover:text-[#EDE9E0] p-1"><span className="material-symbols-outlined text-[20px]">settings</span></button>
-          <button className="px-3 py-1.5 bg-[#D4420A] text-white text-[12px] font-semibold rounded-md hover:bg-[#B33508] flex items-center gap-1">
-            <span className="material-symbols-outlined text-[14px]">share</span>
-            <span className="hidden sm:inline">Share</span>
+          {requestsMenu ? <JoinRequestsMenu {...requestsMenu} /> : null}
+
+          <button
+            onClick={handleShare}
+            className={`px-3 py-1.5 rounded-md text-[12px] font-semibold text-white ${
+              isHost ? 'bg-[#D4420A] hover:bg-[#B33508]' : 'bg-[#8B8178]'
+            }`}
+          >
+            {isHost ? 'Share' : 'Invite Locked'}
           </button>
         </div>
       </header>
 
-      <div className="flex flex-1 overflow-hidden">
-        {/* ━━ Main Canvas — Speaker Zones ━━ */}
-        <main className="flex-1 relative overflow-hidden" style={{
-          backgroundColor: '#F7F4EF',
-          backgroundImage: 'radial-gradient(#D1CDC7 0.8px, transparent 0.8px)',
-          backgroundSize: '32px 32px',
-        }}>
-          {/* Left controls */}
-          <div className="absolute top-4 left-4 flex flex-col gap-2 z-10">
-            <button className="w-10 h-10 bg-white rounded-lg shadow-sm border border-[#18170F]/8 flex items-center justify-center text-[#18170F]/40 hover:text-[#18170F]">
-              <span className="material-symbols-outlined text-[20px]">zoom_in</span>
-            </button>
-            <button className="w-10 h-10 bg-white rounded-lg shadow-sm border border-[#18170F]/8 flex items-center justify-center text-[#18170F]/40 hover:text-[#18170F]">
-              <span className="material-symbols-outlined text-[20px]">zoom_out</span>
-            </button>
-            <button className="w-10 h-10 bg-white rounded-lg shadow-sm border border-[#18170F]/8 flex items-center justify-center text-[#18170F]/40 hover:text-[#18170F]">
-              <span className="material-symbols-outlined text-[20px]">layers</span>
-            </button>
-          </div>
+      <main className="flex-1 overflow-y-auto px-3 sm:px-6 py-3 sm:py-5">
+        <div className={`grid gap-4 ${showPanel ? 'xl:grid-cols-[minmax(0,1fr)_320px]' : 'grid-cols-1'}`}>
+          <section className="min-w-0 space-y-4">
+            <section className="bg-white border border-[#18170F]/10 rounded-2xl p-3 sm:p-4 shadow-sm">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <p className="text-[11px] uppercase tracking-wider text-[#18170F]/45">Current Speaker</p>
+                  <h2 className="text-[16px] font-semibold text-[#18170F]">
+                    {currentSpeaker ? currentSpeaker.name : 'Round not started'}
+                  </h2>
+                  <p className="text-[12px] text-[#18170F]/60 mt-1">
+                    {currentSpeaker
+                      ? `Time remaining: ${formatSeconds(currentSpeaker.timeRemaining)}`
+                      : 'Start the round to begin timing and scoring.'}
+                  </p>
 
-          {/* 4 Speaker Zones */}
-          <div className="absolute inset-4 sm:inset-8 grid grid-cols-1 sm:grid-cols-2 gap-3 sm:gap-4">
-            {ZONES.map((zone, index) => (
-              <div
-                key={zone.id}
-                className="relative rounded-xl p-4 sm:p-6 flex flex-col"
-                style={{
-                  border: `2px dashed ${zone.color}30`,
-                  backgroundColor: index === 0 ? `${zone.color}03` : 'transparent',
-                }}
-              >
-                {/* Zone label */}
-                <div className="flex items-center justify-between mb-3">
-                  <span
-                    className="text-[11px] font-bold uppercase tracking-widest"
-                    style={{ color: zone.color }}
+                  {currentSpeaker ? (
+                    <div className="mt-2 w-full max-w-[260px]">
+                      <div className="h-2 rounded-full bg-[#18170F]/10 overflow-hidden">
+                        <div
+                          className="h-full bg-[#1E5F74] transition-all"
+                          style={{ width: `${currentSpeakerProgress}%` }}
+                        />
+                      </div>
+                      <p className="mt-1 text-[11px] text-[#18170F]/55">{currentSpeakerProgress}% speaking time left</p>
+                    </div>
+                  ) : null}
+                </div>
+
+                <div className="min-w-[220px] rounded-xl border border-[#18170F]/12 bg-[#F8F5F1] p-3">
+                  <p className="text-[11px] uppercase tracking-wider text-[#18170F]/50">My Mic</p>
+                  <p className="mt-1 text-[12px] text-[#18170F]/70">
+                    {canSpeakNow
+                      ? 'Mic is available for you now.'
+                      : 'Mic stays locked until your turn or moderator override.'}
+                  </p>
+                  <button
+                    onClick={handleToggleMyMic}
+                    disabled={isMicBusy || (!canSpeakNow && !isMicOn)}
+                    className={`mt-2 px-3 py-1.5 rounded-lg text-[12px] font-semibold text-white disabled:opacity-60 ${
+                      isMicOn
+                        ? 'bg-[#8B8178] hover:bg-[#756B63]'
+                        : canSpeakNow
+                          ? 'bg-[#2A7A4B] hover:bg-[#22623D]'
+                          : 'bg-[#B8B1A8]'
+                    }`}
                   >
-                    Zone {zone.id} / {zone.user}
-                  </span>
-                  {index === 0 && (
-                    <span className="w-2.5 h-2.5 rounded-full bg-[#2A7A4B] animate-pulse" />
-                  )}
+                    {isMicBusy ? 'Checking...' : isMicOn ? 'Mute Mic' : 'Enable Mic'}
+                  </button>
+                  <p className="mt-1 text-[11px] text-[#18170F]/55">
+                    {isMicOn ? 'Mic is on for your local device.' : 'Mic is currently off.'}
+                  </p>
                 </div>
 
-                {/* Zone content */}
-                <div className="flex-1 rounded-lg overflow-hidden">
-                  {index === 0 ? (
-                    <div className="h-full flex flex-col items-center justify-center gap-3">
-                      <div className="w-full max-w-[200px] h-[100px] sm:h-[140px] bg-white rounded-lg shadow-sm border border-[#18170F]/6 flex items-center justify-center transform -rotate-2">
-                        <div className="w-3/4 h-3/4 bg-gradient-to-br from-[#18170F]/5 to-[#D4420A]/5 rounded flex items-center justify-center">
-                          <span className="text-[#18170F]/20 text-[11px] font-mono">Revenue Chart</span>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    onClick={handleStartRound}
+                    disabled={isMutating || participantList.length === 0 || !canModerate}
+                    className="px-3 py-1.5 rounded-lg bg-[#2A7A4B] text-white text-[12px] font-semibold hover:bg-[#22623D] disabled:opacity-60"
+                  >
+                    Start Round
+                  </button>
+                  <button
+                    onClick={handleNextSpeaker}
+                    disabled={isMutating || !isActive || speakers.length === 0 || !canModerate}
+                    className="px-3 py-1.5 rounded-lg bg-[#1E5F74] text-white text-[12px] font-semibold hover:bg-[#174D5E] disabled:opacity-60"
+                  >
+                    Next Speaker
+                  </button>
+                  <button
+                    onClick={handleEndRound}
+                    disabled={isMutating || (!isActive && !speakers.length) || !canModerate}
+                    className="px-3 py-1.5 rounded-lg bg-[#D4420A] text-white text-[12px] font-semibold hover:bg-[#B33508] disabled:opacity-60"
+                  >
+                    End Round
+                  </button>
+                </div>
+
+                {!canModerate ? (
+                  <p className="text-[12px] text-[#18170F]/45">Round controls are locked to host and moderators.</p>
+                ) : null}
+
+                {canModerate && participantList.length === 0 ? (
+                  <p className="text-[12px] text-[#18170F]/45">
+                    Host is excluded from GD seats. Add participants to start the round.
+                  </p>
+                ) : null}
+              </div>
+            </section>
+
+            <section className="bg-white border border-[#18170F]/10 rounded-2xl p-3 sm:p-4 shadow-sm">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-[14px] font-semibold text-[#18170F]">Speaker Queue</h3>
+                <span className="text-[11px] px-2 py-0.5 rounded bg-[#18170F]/7 text-[#18170F]/65">
+                  {speakers.length} speaker{speakers.length === 1 ? '' : 's'}
+                </span>
+              </div>
+
+              {isLoading ? (
+                <p className="text-[12px] text-[#18170F]/60">Loading GD state...</p>
+              ) : null}
+
+              {!isLoading && speakers.length === 0 ? (
+                <p className="text-[12px] text-[#18170F]/60">No speakers yet. Start round to initialize queue.</p>
+              ) : null}
+
+              {!isLoading && speakers.length > 0 ? (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {speakers.map((speaker, index) => {
+                    const isCurrent = index === currentSpeakerIndex
+                    const speakerUserId = String(speaker.userId || '')
+                    const micGranted = micOverrideSet.has(speakerUserId)
+                    const micStatusLabel = isCurrent
+                      ? 'Mic: Turn active'
+                      : micGranted
+                        ? 'Mic: Override on'
+                        : 'Mic: Locked'
+
+                    return (
+                      <article
+                        key={speaker.userId}
+                        className={`p-3 rounded-xl border ${
+                          isCurrent
+                            ? 'border-[#D4420A]/35 bg-[#D4420A]/[0.04]'
+                            : 'border-[#18170F]/10 bg-[#FDFCF9]'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <p className="text-[13px] font-semibold text-[#18170F] truncate">{speaker.name}</p>
+                          {isCurrent ? (
+                            <span className="text-[10px] text-[#D4420A] font-semibold uppercase tracking-wider">Live</span>
+                          ) : null}
                         </div>
-                      </div>
-                      <p className="text-[12px] text-[#18170F]/50 text-center">Market share projections for 2025 roadmap.</p>
-                    </div>
-                  ) : index === 3 ? (
-                    <div className="h-full flex items-center justify-center">
-                      <div className="bg-[#D4420A] text-white px-4 py-2 rounded-lg text-[12px] font-bold uppercase tracking-wider transform rotate-2 shadow-md">
-                        Revenue Goals: +24% YoY
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="h-full flex items-center justify-center">
-                      <p className="text-[#18170F]/15 text-[13px] italic">Waiting for input...</p>
-                    </div>
-                  )}
+                        <p className="text-[11px] text-[#18170F]/55 mt-1">
+                          Time: {formatSeconds(speaker.timeRemaining)}
+                        </p>
+                        <p className="text-[11px] text-[#18170F]/60 mt-1">{micStatusLabel}</p>
+
+                        {canModerate && !isCurrent ? (
+                          <button
+                            type="button"
+                            onClick={() => handleToggleSpeakerMicAccess(speakerUserId)}
+                            disabled={isMutating}
+                            className={`mt-2 px-2.5 py-1 rounded-md text-[11px] font-semibold text-white disabled:opacity-60 ${
+                              micGranted
+                                ? 'bg-[#8B8178] hover:bg-[#756B63]'
+                                : 'bg-[#1E5F74] hover:bg-[#174D5E]'
+                            }`}
+                          >
+                            {micGranted ? 'Revoke Override' : 'Allow Mic'}
+                          </button>
+                        ) : null}
+                      </article>
+                    )
+                  })}
                 </div>
+              ) : null}
+            </section>
+
+            <section className="bg-white border border-[#18170F]/10 rounded-2xl p-3 sm:p-4 shadow-sm overflow-hidden">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-[14px] font-semibold text-[#18170F]">Round Table Simulator</h3>
+                <span className="text-[11px] px-2 py-0.5 rounded bg-[#2A7A4B]/10 text-[#2A7A4B]">
+                  {roundTableParticipants.length} seat{roundTableParticipants.length === 1 ? '' : 's'}
+                </span>
               </div>
-            ))}
-          </div>
 
-          {/* Circular Timer (center) */}
-          <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-10">
-            <div className="w-[100px] h-[100px] sm:w-[120px] sm:h-[120px] bg-white rounded-full shadow-xl flex items-center justify-center">
-              <svg className="absolute inset-0" viewBox="0 0 120 120">
-                <circle cx="60" cy="60" r="52" fill="none" stroke="#18170F08" strokeWidth="4" />
-                <circle
-                  cx="60" cy="60" r="52"
-                  fill="none" stroke="#D4420A" strokeWidth="4"
-                  strokeLinecap="round"
-                  strokeDasharray={circumference}
-                  strokeDashoffset={dashOffset}
-                  transform="rotate(-90 60 60)"
-                  className="transition-all duration-1000"
-                />
-              </svg>
-              <span className="text-[24px] sm:text-[28px] font-bold text-[#18170F] font-mono relative z-10">
-                {timerSeconds}s
-              </span>
-            </div>
-          </div>
+              {roundTableParticipants.length === 0 ? (
+                <p className="text-[12px] text-[#18170F]/60">
+                  Add participants and start a round to activate the table.
+                </p>
+              ) : (
+                <>
+                  <div className="relative mx-auto h-[320px] max-w-[560px] rounded-2xl border border-[#18170F]/8 bg-[linear-gradient(135deg,#FCF8F2_0%,#F2E9DC_100%)] overflow-hidden">
+                    <div className="absolute inset-0 pointer-events-none">
+                      <div className="absolute left-1/2 top-1/2 w-[220px] h-[220px] sm:w-[250px] sm:h-[250px] -translate-x-1/2 -translate-y-1/2 rounded-full border border-[#18170F]/15 bg-[radial-gradient(circle,#E6DAC8_0%,#D6C1A5_60%,#B49474_100%)] shadow-inner" />
 
-          {/* Bottom Toolbar */}
-          <div className="absolute bottom-14 sm:bottom-16 left-1/2 -translate-x-1/2 flex items-center gap-0.5 bg-[#2C2C28] rounded-2xl px-2 py-1.5 shadow-xl z-20">
-            {[
-              { icon: 'edit', label: 'Draw', active: true },
-              { icon: 'near_me', label: 'Select' },
-              { icon: 'sticky_note_2', label: 'Sticky' },
-              { icon: 'category', label: 'Shape' },
-              { icon: 'title', label: 'Text' },
-            ].map((tool) => (
-              <button key={tool.icon} className={`flex flex-col items-center gap-0.5 px-3 py-2 rounded-xl ${tool.active ? 'bg-[#D4420A] text-white' : 'text-[#EDE9E0]/60 hover:text-[#EDE9E0] hover:bg-white/10'}`}>
-                <span className="material-symbols-outlined text-[20px]">{tool.icon}</span>
-                <span className="text-[9px] font-medium">{tool.label}</span>
-              </button>
-            ))}
-          </div>
-        </main>
+                      <div className="absolute left-1/2 top-1/2 w-[130px] h-[130px] -translate-x-1/2 -translate-y-1/2 rounded-full border border-white/50 bg-white/40 backdrop-blur-[1px] flex flex-col items-center justify-center px-2 text-center">
+                        <p className="text-[10px] uppercase tracking-[0.12em] text-[#18170F]/50">Live Focus</p>
+                        <p className="mt-1 text-[12px] font-semibold text-[#18170F] truncate w-full">
+                          {focusedSeat ? focusedSeat.name : 'Waiting'}
+                        </p>
+                        <p className="text-[10px] text-[#18170F]/55">
+                          {focusedSeat?.isCurrent ? 'Speaking now' : 'Tap a seat'}
+                        </p>
+                      </div>
+                    </div>
 
-        {/* ━━ Right Sidebar — Live Assessment ━━ */}
-        <aside className="hidden lg:flex w-[280px] sm:w-[300px] bg-[#FEFCF8] border-l border-[#18170F]/6 flex-col shrink-0">
-          <div className="p-5 border-b border-[#18170F]/6">
-            <p className="text-[11px] font-bold text-[#18170F]/40 uppercase tracking-wider">Live Assessment</p>
-            <h3 className="text-[22px] font-bold text-[#18170F] mt-1">Scoring</h3>
-          </div>
+                    {roundTableSeats.map((seat) => (
+                      <div
+                        key={`seat-${seat.id}`}
+                        className="absolute"
+                        style={{
+                          left: `calc(50% + ${seat.x}px)`,
+                          top: `calc(50% + ${seat.y}px)`,
+                          transform: 'translate(-50%, -50%)',
+                        }}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => setSelectedSpeakerId(seat.id)}
+                          className={`relative w-11 h-11 rounded-full border-2 border-white text-white text-[11px] font-bold shadow-md transition-all hover:scale-105 ${
+                            seat.isCurrent ? 'scale-110 ring-2 ring-[#D4420A]/45 ring-offset-2 ring-offset-[#F4ECE0]' : ''
+                          } ${
+                            seat.isSelected && !seat.isCurrent
+                              ? 'ring-2 ring-[#1E5F74]/45 ring-offset-2 ring-offset-[#F4ECE0]'
+                              : ''
+                          }`}
+                          style={{ backgroundColor: seat.color }}
+                          title={`Seat: ${seat.name}`}
+                        >
+                          {getInitials(seat.name)}
 
-          <div className="p-5 space-y-6 flex-1">
-            {/* Clarity score */}
-            <div>
-              <div className="flex justify-between items-center mb-3">
-                <span className="text-[13px] font-semibold text-[#18170F] uppercase tracking-wide">Clarity</span>
-                <span className="text-[20px] font-bold text-[#D4420A]">8.4</span>
-              </div>
-              <div className="relative h-[3px] bg-[#18170F]/6 rounded-full">
-                <div className="absolute h-full bg-[#D4420A] rounded-full" style={{ width: '84%' }} />
-                <div
-                  className="absolute w-3 h-3 bg-[#D4420A] rounded-full -top-[4.5px] shadow-sm"
-                  style={{ left: 'calc(84% - 6px)' }}
-                />
-              </div>
-            </div>
+                          {seat.averageLabel ? (
+                            <span className="absolute -top-2 -right-2 px-1.5 py-0.5 rounded-full bg-white border border-[#18170F]/10 text-[9px] font-semibold text-[#18170F]/75">
+                              {seat.averageLabel}
+                            </span>
+                          ) : null}
 
-            {/* Relevance score */}
-            <div>
-              <div className="flex justify-between items-center mb-3">
-                <span className="text-[13px] font-semibold text-[#18170F] uppercase tracking-wide">Relevance</span>
-                <span className="text-[20px] font-bold text-[#D4420A]">7.2</span>
-              </div>
-              <div className="relative h-[3px] bg-[#18170F]/6 rounded-full">
-                <div className="absolute h-full bg-[#D4420A] rounded-full" style={{ width: '72%' }} />
-                <div
-                  className="absolute w-3 h-3 bg-[#D4420A] rounded-full -top-[4.5px] shadow-sm"
-                  style={{ left: 'calc(72% - 6px)' }}
-                />
-              </div>
-            </div>
+                          {seat.isCurrent ? (
+                            <span className="absolute -bottom-2 left-1/2 -translate-x-1/2 px-1.5 py-0.5 rounded-full bg-[#D4420A] text-white text-[9px] font-semibold uppercase tracking-wider">
+                              Live
+                            </span>
+                          ) : null}
+                        </button>
 
-            {/* Judge Notes */}
-            <div>
-              <label className="text-[11px] font-bold text-[#18170F]/40 uppercase tracking-wider block mb-2">
-                Judge Notes
-              </label>
-              <textarea
-                value={judgeNotes}
-                onChange={(e) => setJudgeNotes(e.target.value)}
-                placeholder="Type observation..."
-                className="w-full bg-[#18170F]/[0.02] rounded-lg p-3 text-sm text-[#18170F] placeholder:text-[#18170F]/20 outline-none border border-[#18170F]/6 focus:border-[#D4420A]/30 resize-none"
-                rows={4}
-              />
-            </div>
-          </div>
+                        <p className="mt-1 text-[10px] font-semibold text-[#18170F]/70 text-center max-w-[90px] truncate">
+                          {seat.name}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
 
-          {/* Invite button */}
-          <div className="p-5 border-t border-[#18170F]/6">
-            <button className="w-full py-2.5 bg-[#D4420A] text-white text-[12px] font-semibold rounded-lg hover:bg-[#B33508] transition-colors uppercase tracking-wider">
-              Invite Member
-            </button>
-          </div>
-        </aside>
-      </div>
+                  <p className="mt-2 text-[11px] text-[#18170F]/60">
+                    Interactive round table view. Click a seat to quickly target scoring.
+                    {roundTableOverflowCount > 0
+                      ? ` +${roundTableOverflowCount} more participant${roundTableOverflowCount === 1 ? '' : 's'} shown in queue.`
+                      : ''}
+                  </p>
+                </>
+              )}
+            </section>
 
-      {/* ━━ Bottom Speaker Bar ━━ */}
-      <footer className="h-[44px] bg-[#2C2C28] px-4 sm:px-6 flex items-center justify-between shrink-0">
-        <div className="flex items-center gap-3">
-          <span className="text-[11px] font-bold text-[#EDE9E0]/40 uppercase tracking-wider hidden sm:inline">Queue Order</span>
-          <div className="flex -space-x-2">
-            {ZONES.slice(0, 3).map((zone, i) => (
-              <div
-                key={zone.id}
-                className="w-7 h-7 rounded-full border-2 border-[#2C2C28] flex items-center justify-center text-[10px] font-bold text-white"
-                style={{ backgroundColor: zone.color }}
-              >
-                {zone.user.charAt(0)}
-              </div>
-            ))}
-          </div>
+            {speakerLeaderboard.length > 0 ? (
+              <section className="bg-white border border-[#18170F]/10 rounded-2xl p-3 sm:p-4 shadow-sm">
+                <div className="flex items-center justify-between mb-3">
+                  <h3 className="text-[14px] font-semibold text-[#18170F]">Performance Pulse</h3>
+                  <span className="text-[11px] px-2 py-0.5 rounded bg-[#1E5F74]/10 text-[#1E5F74]">
+                    Live ranking
+                  </span>
+                </div>
+
+                <div className="space-y-2">
+                  {speakerLeaderboard.map((entry, index) => (
+                    <article
+                      key={`rank-${entry.userId}`}
+                      className="p-2.5 rounded-lg bg-[#F8F5F1] border border-[#18170F]/8"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="text-[12px] font-semibold text-[#18170F] truncate">
+                          #{index + 1} {entry.name}
+                        </p>
+                        <span className="text-[11px] font-semibold text-[#1E5F74]">{entry.averageLabel}</span>
+                      </div>
+                      <div className="mt-1.5 h-1.5 rounded-full bg-[#18170F]/10 overflow-hidden">
+                        <div
+                          className="h-full bg-[#2A7A4B]"
+                          style={{ width: `${entry.averagePercent}%` }}
+                        />
+                      </div>
+                    </article>
+                  ))}
+                </div>
+
+                {scoreInsights.length > 0 ? (
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {scoreInsights.map((insight) => (
+                      <span
+                        key={insight}
+                        className="px-2 py-1 rounded bg-[#18170F]/7 text-[11px] text-[#18170F]/75"
+                      >
+                        {insight}
+                      </span>
+                    ))}
+                  </div>
+                ) : null}
+              </section>
+            ) : null}
+
+            {canViewSummary && summary ? (
+              <section className="bg-white border border-[#18170F]/10 rounded-2xl p-3 sm:p-4 shadow-sm">
+                <h3 className="text-[14px] font-semibold text-[#18170F] mb-2">GD Summary</h3>
+                <pre className="whitespace-pre-wrap text-[13px] text-[#18170F]/80 leading-relaxed font-body">
+                  {summary}
+                </pre>
+              </section>
+            ) : null}
+
+            {!canViewSummary && !isActive && speakers.length > 0 ? (
+              <section className="bg-white border border-[#18170F]/10 rounded-2xl p-3 sm:p-4 shadow-sm">
+                <h3 className="text-[14px] font-semibold text-[#18170F] mb-1">GD Summary</h3>
+                <p className="text-[12px] text-[#18170F]/65">
+                  Round analysis is visible only to the host.
+                </p>
+              </section>
+            ) : null}
+          </section>
+
+          {showPanel ? (
+            <aside className="bg-white border border-[#18170F]/10 rounded-2xl p-3 sm:p-4 shadow-sm h-fit xl:sticky xl:top-4">
+              <section>
+                <h3 className="text-[13px] font-semibold text-[#18170F] mb-2">Live Scoring</h3>
+
+                {canModerate ? (
+                  <>
+                    <select
+                      value={selectedSpeakerId}
+                      onChange={(event) => setSelectedSpeakerId(event.target.value)}
+                      className="w-full mb-3 px-3 py-2 rounded-lg border border-[#18170F]/15 text-[13px] text-[#18170F] focus:border-[#D4420A]/40 outline-none bg-white"
+                    >
+                      <option value="">Select speaker</option>
+                      {speakers.map((speaker) => (
+                        <option key={speaker.userId} value={speaker.userId}>
+                          {speaker.name}
+                        </option>
+                      ))}
+                    </select>
+
+                    {SCORE_FIELDS.map((field) => (
+                      <div key={field.key} className="mb-3 last:mb-0">
+                        <div className="flex items-center justify-between mb-1">
+                          <span className="text-[12px] font-semibold text-[#18170F]/75">{field.label}</span>
+                          <span className="text-[12px] text-[#D4420A] font-semibold">{scoreDraft[field.key]}</span>
+                        </div>
+                        <input
+                          type="range"
+                          min="0"
+                          max="10"
+                          step="1"
+                          value={scoreDraft[field.key]}
+                          onChange={(event) =>
+                            setScoreDraft((previous) => ({
+                              ...previous,
+                              [field.key]: Number(event.target.value),
+                            }))
+                          }
+                          className="w-full accent-[#D4420A]"
+                        />
+                      </div>
+                    ))}
+
+                    <button
+                      onClick={handleSubmitScore}
+                      disabled={isMutating || !selectedScoreTarget}
+                      className="w-full mt-3 px-3 py-2 rounded-lg bg-[#D4420A] text-white text-[12px] font-semibold hover:bg-[#B33508] disabled:opacity-60"
+                    >
+                      Submit Score
+                    </button>
+
+                    {selectedScoreTarget ? (
+                      <p className="mt-2 text-[11px] text-[#18170F]/55">
+                        Scoring: {selectedScoreTarget.name}
+                      </p>
+                    ) : null}
+                  </>
+                ) : (
+                  <p className="text-[12px] text-[#18170F]/55 p-3 rounded-lg bg-[#F8F5F1] border border-[#18170F]/8">
+                    Live scoring controls are available to host and moderators only.
+                  </p>
+                )}
+              </section>
+
+              <section className="mt-4">
+                <h3 className="text-[13px] font-semibold text-[#18170F] mb-2">Saved Scores</h3>
+                <div className="space-y-2 max-h-[180px] overflow-y-auto pr-1">
+                  {Object.keys(scores || {}).length === 0 ? (
+                    <p className="text-[12px] text-[#18170F]/55">No scores submitted yet.</p>
+                  ) : null}
+
+                  {Object.entries(scores || {}).map(([speakerUserId, scoreObj]) => {
+                    const speaker = speakers.find((item) => item.userId === speakerUserId)
+                    return (
+                      <article
+                        key={speakerUserId}
+                        className="p-2.5 rounded-lg bg-[#F8F5F1] border border-[#18170F]/8"
+                      >
+                        <p className="text-[12px] font-semibold text-[#18170F] truncate">
+                          {speaker?.name || speakerUserId}
+                        </p>
+                        <p className="text-[11px] text-[#18170F]/60 mt-1 break-words">
+                          {Object.entries(scoreObj)
+                            .map(([key, value]) => `${key}: ${value}`)
+                            .join(', ')}
+                        </p>
+                      </article>
+                    )
+                  })}
+                </div>
+              </section>
+
+              <section className="mt-4">
+                <h3 className="text-[13px] font-semibold text-[#18170F] mb-2">Coach Prompts</h3>
+                <div className="space-y-2">
+                  {coachPrompts.map((prompt) => (
+                    <p
+                      key={prompt}
+                      className="text-[12px] text-[#18170F]/75 p-2.5 rounded-lg bg-[#F8F5F1] border border-[#18170F]/8"
+                    >
+                      {prompt}
+                    </p>
+                  ))}
+                </div>
+              </section>
+            </aside>
+          ) : null}
         </div>
-
-        <div className="flex items-center gap-3">
-          <div className="flex items-center gap-2">
-            <span className="w-2 h-2 rounded-full bg-[#D4420A] animate-pulse" />
-            <span className="text-[12px] font-semibold text-[#EDE9E0] uppercase tracking-wider">
-              <span className="hidden sm:inline">Live: </span>Marcus is speaking
-            </span>
-          </div>
-          <button className="px-4 py-1.5 border border-[#EDE9E0]/20 text-[#EDE9E0] text-[11px] font-semibold rounded-md uppercase tracking-wider hover:bg-white/5">
-            Next Speaker
-          </button>
-        </div>
-      </footer>
+      </main>
     </div>
   )
 }

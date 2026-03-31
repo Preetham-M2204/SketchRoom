@@ -1,26 +1,27 @@
 import { useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { signup, bypassLogin } from '../api/auth'
 import { toast } from '../components/ui/Toast'
 import CustomCursor from '../components/ui/CustomCursor'
 
 const Signup = () => {
   const navigate = useNavigate()
+  const location = useLocation()
+  const redirectPath = new URLSearchParams(location.search).get('redirect') || '/dashboard'
   const [formData, setFormData] = useState({
     name: '',
     email: '',
     password: '',
-    agreeTerms: false,
   })
   const [showPassword, setShowPassword] = useState(false)
   const [errors, setErrors] = useState({})
   const [isLoading, setIsLoading] = useState(false)
 
   const handleChange = (e) => {
-    const { name, value, type, checked } = e.target
+    const { name, value } = e.target
     setFormData((prev) => ({
       ...prev,
-      [name]: type === 'checkbox' ? checked : value,
+      [name]: value,
     }))
 
     if (errors[name]) {
@@ -49,9 +50,6 @@ const Signup = () => {
     } else if (formData.password.length < 6) {
       newErrors.password = 'Password must be at least 6 characters'
     }
-    if (!formData.agreeTerms) {
-      newErrors.agreeTerms = 'You must agree to the terms'
-    }
     setErrors(newErrors)
     return Object.keys(newErrors).length === 0
   }
@@ -68,7 +66,7 @@ const Signup = () => {
         password: formData.password,
       })
       toast.success('Account created successfully!')
-      navigate('/dashboard')
+      navigate(redirectPath)
     } catch (error) {
       toast.error(error.message || 'Signup failed. Please try again.')
       if (error.message?.includes('email')) {
@@ -82,7 +80,7 @@ const Signup = () => {
   const handleBypass = () => {
     bypassLogin()
     toast.success('Testing bypass enabled')
-    navigate('/dashboard')
+    navigate(redirectPath)
   }
 
   return (
@@ -200,22 +198,6 @@ const Signup = () => {
                 )}
                 {errors.password && <p className="text-[11px] text-error pt-1">{errors.password}</p>}
               </div>
-
-              <div className="flex items-start gap-3 py-2">
-                <input
-                  id="terms"
-                  name="agreeTerms"
-                  type="checkbox"
-                  checked={formData.agreeTerms}
-                  onChange={handleChange}
-                  className="mt-1 rounded-none border-outline-variant text-primary focus:ring-primary cursor-pointer h-4 w-4"
-                />
-                <label className="text-[11px] leading-relaxed text-on-surface-variant" htmlFor="terms">
-                  I agree to the <a className="underline hover:text-primary transition-colors" href="#">Terms of Service</a> and{' '}
-                  <a className="underline hover:text-primary transition-colors" href="#">Privacy Policy</a>.
-                </label>
-              </div>
-              {errors.agreeTerms && <p className="text-[11px] text-error -mt-3">{errors.agreeTerms}</p>}
 
               <button
                 type="submit"

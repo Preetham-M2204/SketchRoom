@@ -1,169 +1,315 @@
 import { useEffect, useRef, useState } from 'react'
+import { nanoid } from 'nanoid'
 import useCanvasStore from '../stores/useCanvasStore'
 import useRoomStore from '../stores/useRoomStore'
 import { drawStroke } from '../utils/drawStroke'
 import { replayCanvas } from '../utils/replayCanvas'
-import { nanoid } from 'nanoid'
 
-/**
- * useCanvas Hook
- * Handles canvas drawing logic, mouse events, and stroke creation
- *
- * What it does:
- * - Sets up canvas element and 2D context
- * - Tracks mouse position and drawing state
- * - Collects points while drawing
- * - Emits complete strokes to socket
- * - Replays all strokes when they change
- *
- * Usage:
- * const { canvasRef, isDrawing } = useCanvas(socket, userId)
- *
- * @param {Socket} socket - Socket.io instance
- * @param {string} userId - Current user's ID
- * @returns {Object} { canvasRef, isDrawing }
- */
+const DRAW_TOOLS = new Set(['pen', 'eraser', 'line', 'rectangle', 'circle'])
+const SHAPE_TOOLS = new Set(['line', 'rectangle', 'circle'])
+const MAX_STROKE_POINTS = 2000
 
-const useCanvas = (socket, userId) => {
+function normalizeViewport(viewport = {}) {
+  const zoom = Number.isFinite(viewport?.zoom) ? viewport.zoom : 1
+  return {
+    x: Number.isFinite(viewport?.x) ? viewport.x : 0,
+    y: Number.isFinite(viewport?.y) ? viewport.y : 0,
+    zoom: Math.min(Math.max(zoom, 0.1), 8),
+  }
+}
+
+const useCanvas = (socket, userId, viewport = { x: 0, y: 0, zoom: 1 }) => {
   const canvasRef = useRef(null)
   const ctxRef = useRef(null)
   const [isDrawing, setIsDrawing] = useState(false)
-  const currentStrokeRef = useRef([]) // Points being drawn right now
+  const isDrawingRef = useRef(false)
+  const currentStrokeRef = useRef([])
+  const startPointRef = useRef(null)
+  const strokesRef = useRef([])
+  const viewportRef = useRef(normalizeViewport(viewport))
+  const activeTouchPointersRef = useRef(new Set())
 
   const activeTool = useCanvasStore((state) => state.activeTool)
   const color = useCanvasStore((state) => state.color)
   const strokeWidth = useCanvasStore((state) => state.strokeWidth)
+
   const strokes = useRoomStore((state) => state.strokes)
   const addStroke = useRoomStore((state) => state.addStroke)
 
-  // Initialize canvas
+  useEffect(() => {
+    strokesRef.current = strokes
+  }, [strokes])
+
+  useEffect(() => {
+    viewportRef.current = normalizeViewport(viewport)
+  }, [viewport])
+
   useEffect(() => {
     if (!canvasRef.current) return
 
     const canvas = canvasRef.current
     const ctx = canvas.getContext('2d')
-    ctxRef.current = ctx
+    if (!ctx) return
 
-    // Set canvas size to container size
+    ctxRef.current = ctx
+    canvas.style.touchAction = 'none'
+
     const resizeCanvas = () => {
       const container = canvas.parentElement
+      if (!container) return
+
       canvas.width = container.clientWidth
       canvas.height = container.clientHeight
-
-      // Replay all strokes after resize
-      replayCanvas(ctx, strokes, canvas.width, canvas.height)
+      replayCanvas(ctx, strokesRef.current, canvas.width, canvas.height, viewportRef.current)
     }
 
     resizeCanvas()
     window.addEventListener('resize', resizeCanvas)
 
-    return () => window.removeEventListener('resize', resizeCanvas)
+    return () => {
+      window.removeEventListener('resize', resizeCanvas)
+    }
   }, [])
 
-  // Replay strokes whenever they change
   useEffect(() => {
     if (!ctxRef.current || !canvasRef.current) return
 
-    const ctx = ctxRef.current
-    const canvas = canvasRef.current
-
-    replayCanvas(ctx, strokes, canvas.width, canvas.height)
+    replayCanvas(
+      ctxRef.current,
+      strokes,
+      canvasRef.current.width,
+      canvasRef.current.height,
+      viewportRef.current
+    )
   }, [strokes])
 
-  // Get mouse position relative to canvas
-  const getMousePos = (e) => {
+  useEffect(() => {
+    if (!ctxRef.current || !canvasRef.current) return
+
+    replayCanvas(
+      ctxRef.current,
+      strokesRef.current,
+      canvasRef.current.width,
+      canvasRef.current.height,
+      viewportRef.current
+    )
+  }, [viewport])
+
+  const getPointerPos = (event) => {
     const canvas = canvasRef.current
+    if (!canvas) return { x: 0, y: 0 }
+
     const rect = canvas.getBoundingClientRect()
+    const activeViewport = viewportRef.current
+    const screenX = event.clientX - rect.left
+    const screenY = event.clientY - rect.top
+
     return {
-      x: e.clientX - rect.left,
-      y: e.clientY - rect.top,
+      x: (screenX - activeViewport.x) / activeViewport.zoom,
+      y: (screenY - activeViewport.y) / activeViewport.zoom,
     }
   }
 
-  // Mouse down - start drawing
-  const handleMouseDown = (e) => {
-    if (activeTool !== 'pen') return
-
-    setIsDrawing(true)
-    const pos = getMousePos(e)
-    currentStrokeRef.current = [pos]
-
-    // Draw starting point
+  const drawWithViewport = (stroke) => {
     const ctx = ctxRef.current
-    ctx.fillStyle = color
-    ctx.beginPath()
-    ctx.arc(pos.x, pos.y, strokeWidth / 2, 0, Math.PI * 2)
-    ctx.fill()
+    if (!ctx) return
+
+    const activeViewport = viewportRef.current
+
+    ctx.save()
+    ctx.setTransform(
+      activeViewport.zoom,
+      0,
+      0,
+      activeViewport.zoom,
+      activeViewport.x,
+      activeViewport.y
+    )
+    drawStroke(ctx, stroke)
+    ctx.restore()
   }
 
-  // Mouse move - collect points
-  const handleMouseMove = (e) => {
-    if (!isDrawing || activeTool !== 'pen') return
-
-    const pos = getMousePos(e)
-    currentStrokeRef.current.push(pos)
-
-    // Draw line to new point
-    const ctx = ctxRef.current
-    const points = currentStrokeRef.current
-    const prevPoint = points[points.length - 2]
-
-    ctx.strokeStyle = color
-    ctx.lineWidth = strokeWidth
-    ctx.lineCap = 'round'
-    ctx.lineJoin = 'round'
-
-    ctx.beginPath()
-    ctx.moveTo(prevPoint.x, prevPoint.y)
-    ctx.lineTo(pos.x, pos.y)
-    ctx.stroke()
+  const getNormalizedTool = () => {
+    if (DRAW_TOOLS.has(activeTool)) return activeTool
+    return 'pen'
   }
 
-  // Mouse up - finish stroke
-  const handleMouseUp = () => {
-    if (!isDrawing) return
+  const getEffectiveStrokeWidth = (tool) => {
+    if (tool === 'eraser') {
+      return Math.max(strokeWidth * 3, 10)
+    }
 
-    setIsDrawing(false)
+    return strokeWidth
+  }
 
-    // Create stroke object
-    const stroke = {
+  const buildStrokePayload = (points) => {
+    const tool = getNormalizedTool()
+
+    return {
       id: nanoid(),
       userId,
-      points: currentStrokeRef.current,
-      color,
-      width: strokeWidth,
+      tool,
+      points,
+      color: tool === 'eraser' ? '__ERASER__' : color,
+      width: getEffectiveStrokeWidth(tool),
       timestamp: Date.now(),
     }
-
-    // Add to store
-    addStroke(stroke)
-
-    // Emit to socket
-    if (socket) {
-      socket.emit('draw:stroke', stroke)
-    }
-
-    // Reset current stroke
-    currentStrokeRef.current = []
   }
 
-  // Attach event listeners
   useEffect(() => {
     const canvas = canvasRef.current
-    if (!canvas) return
+    const ctx = ctxRef.current
+    if (!canvas || !ctx) return
 
-    canvas.addEventListener('mousedown', handleMouseDown)
-    canvas.addEventListener('mousemove', handleMouseMove)
-    canvas.addEventListener('mouseup', handleMouseUp)
-    canvas.addEventListener('mouseleave', handleMouseUp)
+    const handlePointerDown = (event) => {
+      if (event.pointerType === 'touch') {
+        activeTouchPointersRef.current.add(event.pointerId)
+
+        if (activeTouchPointersRef.current.size > 1) {
+          isDrawingRef.current = false
+          setIsDrawing(false)
+          currentStrokeRef.current = []
+          startPointRef.current = null
+          replayCanvas(ctx, strokesRef.current, canvas.width, canvas.height, viewportRef.current)
+          return
+        }
+      }
+
+      if (!DRAW_TOOLS.has(activeTool)) return
+      if (event.pointerType === 'mouse' && event.button !== 0) return
+
+      if (event.pointerType === 'touch' && activeTouchPointersRef.current.size > 1) return
+
+      event.preventDefault()
+
+      if (canvas.setPointerCapture) {
+        canvas.setPointerCapture(event.pointerId)
+      }
+
+      const pos = getPointerPos(event)
+      startPointRef.current = pos
+      currentStrokeRef.current = [pos]
+      isDrawingRef.current = true
+      setIsDrawing(true)
+
+      const tool = getNormalizedTool()
+      if (tool === 'pen' || tool === 'eraser') {
+        const firstDot = {
+          tool,
+          points: [pos],
+          color: tool === 'eraser' ? '__ERASER__' : color,
+          width: getEffectiveStrokeWidth(tool),
+        }
+        drawWithViewport(firstDot)
+      }
+    }
+
+    const handlePointerMove = (event) => {
+      if (!isDrawingRef.current || !DRAW_TOOLS.has(activeTool)) return
+      if (event.pointerType === 'touch' && activeTouchPointersRef.current.size > 1) return
+
+      event.preventDefault()
+      const pos = getPointerPos(event)
+      const tool = getNormalizedTool()
+
+      if (SHAPE_TOOLS.has(tool)) {
+        currentStrokeRef.current = [startPointRef.current, pos]
+        replayCanvas(ctx, strokesRef.current, canvas.width, canvas.height, viewportRef.current)
+        drawWithViewport({
+          tool,
+          points: currentStrokeRef.current,
+          color,
+          width: getEffectiveStrokeWidth(tool),
+        })
+        return
+      }
+
+      currentStrokeRef.current.push(pos)
+      if (currentStrokeRef.current.length > MAX_STROKE_POINTS) {
+        currentStrokeRef.current.shift()
+      }
+
+      const points = currentStrokeRef.current
+      const prevPoint = points[points.length - 2]
+      if (!prevPoint) return
+
+      drawWithViewport({
+        tool,
+        points: [prevPoint, pos],
+        color: tool === 'eraser' ? '__ERASER__' : color,
+        width: getEffectiveStrokeWidth(tool),
+      })
+    }
+
+    const finishStroke = () => {
+      if (!isDrawingRef.current) return
+
+      const tool = getNormalizedTool()
+      const points = currentStrokeRef.current
+
+      isDrawingRef.current = false
+      setIsDrawing(false)
+      currentStrokeRef.current = []
+      startPointRef.current = null
+
+      if (!points.length) return
+
+      if (SHAPE_TOOLS.has(tool)) {
+        const [start, end] = points
+        if (!start || !end) {
+          replayCanvas(ctx, strokesRef.current, canvas.width, canvas.height, viewportRef.current)
+          return
+        }
+
+        if (start.x === end.x && start.y === end.y) {
+          replayCanvas(ctx, strokesRef.current, canvas.width, canvas.height, viewportRef.current)
+          return
+        }
+      }
+
+      const stroke = buildStrokePayload(points)
+      addStroke(stroke)
+
+      if (socket) {
+        socket.emit('draw:stroke', stroke)
+      }
+    }
+
+    const handlePointerUp = (event) => {
+      if (event?.pointerType === 'touch') {
+        activeTouchPointersRef.current.delete(event.pointerId)
+      }
+
+      if (event?.preventDefault) {
+        event.preventDefault()
+      }
+
+      if (event?.pointerId !== undefined && canvas.releasePointerCapture) {
+        try {
+          canvas.releasePointerCapture(event.pointerId)
+        } catch {
+          // Ignore release failures when capture is already gone.
+        }
+      }
+
+      finishStroke()
+    }
+
+    canvas.addEventListener('pointerdown', handlePointerDown)
+    canvas.addEventListener('pointermove', handlePointerMove)
+    canvas.addEventListener('pointercancel', handlePointerUp)
+    canvas.addEventListener('pointerleave', handlePointerUp)
+    window.addEventListener('pointerup', handlePointerUp)
 
     return () => {
-      canvas.removeEventListener('mousedown', handleMouseDown)
-      canvas.removeEventListener('mousemove', handleMouseMove)
-      canvas.removeEventListener('mouseup', handleMouseUp)
-      canvas.removeEventListener('mouseleave', handleMouseUp)
+      activeTouchPointersRef.current.clear()
+      canvas.removeEventListener('pointerdown', handlePointerDown)
+      canvas.removeEventListener('pointermove', handlePointerMove)
+      canvas.removeEventListener('pointercancel', handlePointerUp)
+      canvas.removeEventListener('pointerleave', handlePointerUp)
+      window.removeEventListener('pointerup', handlePointerUp)
     }
-  }, [activeTool, color, strokeWidth, isDrawing])
+  }, [activeTool, color, strokeWidth, socket, userId, addStroke])
 
   return {
     canvasRef,

@@ -1,127 +1,187 @@
-import { useEffect } from 'react'
+import { useCallback, useEffect, useState } from 'react'
+import {
+  addDecisionItem,
+  getDecisionState,
+  removeDecisionItem,
+  updateDecisionPhase,
+  voteDecisionItem,
+} from '../api/rooms'
 import useModeStore from '../stores/useModeStore'
-import { getDecisionAnalysis } from '../api/ai'
 import { toast } from '../components/ui/Toast'
-
-/**
- * useDecision Hook
- * Manages Decision Board mode logic
- *
- * What it does:
- * - Listens to decision-specific socket events
- * - Handles phase transitions (brainstorm → voting → analysis)
- * - Fetches AI analysis from Claude
- * - Syncs decision items and votes across all users
- *
- * Decision Board phases:
- * 1. Brainstorm: Add pros/cons/strengths/weaknesses
- * 2. Voting: Members upvote items
- * 3. Analysis: Claude generates strategic summary
- *
- * Usage:
- * useDecision(socket, roomId)
- *
- * @param {Socket} socket - Socket.io instance
- * @param {string} roomId - Current room ID
- */
 
 const useDecision = (socket, roomId) => {
   const phase = useModeStore((state) => state.decision.phase)
   const items = useModeStore((state) => state.decision.items)
-  const setDecisionPhase = useModeStore((state) => state.setDecisionPhase)
-  const addDecisionItem = useModeStore((state) => state.addDecisionItem)
-  const removeDecisionItem = useModeStore((state) => state.removeDecisionItem)
-  const voteOnItem = useModeStore((state) => state.voteOnItem)
-  const setDecisionAnalysis = useModeStore((state) => state.setDecisionAnalysis)
+  const analysis = useModeStore((state) => state.decision.analysis)
+  const setDecisionState = useModeStore((state) => state.setDecisionState)
 
-  // Socket event listeners
-  useEffect(() => {
-    if (!socket || !roomId) return
+  const [isLoading, setIsLoading] = useState(true)
+  const [isMutating, setIsMutating] = useState(false)
 
-    // Phase change
-    socket.on('decision:set-phase', ({ phase }) => {
-      setDecisionPhase(phase)
-      toast.info(`Phase: ${phase}`)
-    })
+  const syncDecisionState = useCallback(
+    async ({ silent = false } = {}) => {
+      if (!roomId) return null
 
-    // New item added
-    socket.on('decision:add-item', ({ item }) => {
-      addDecisionItem(item)
-    })
-
-    // Item removed
-    socket.on('decision:remove-item', ({ itemId }) => {
-      removeDecisionItem(itemId)
-    })
-
-    // Vote added
-    socket.on('decision:vote', ({ itemId, userId }) => {
-      voteOnItem(itemId, userId)
-    })
-
-    return () => {
-      socket.off('decision:set-phase')
-      socket.off('decision:add-item')
-      socket.off('decision:remove-item')
-      socket.off('decision:vote')
-    }
-  }, [socket, roomId])
-
-  // Fetch AI analysis when entering analysis phase
-  useEffect(() => {
-    if (phase !== 'analysis' || items.length === 0) return
-
-    const fetchAnalysis = async () => {
       try {
-        toast.info('Requesting AI analysis...')
-        const analysis = await getDecisionAnalysis({ items })
-        setDecisionAnalysis(analysis)
-        toast.success('Analysis complete')
+        const state = await getDecisionState(roomId)
+        setDecisionState(state)
+        return state
       } catch (error) {
-        toast.error('Failed to get AI analysis')
-        console.error(error)
+        if (!silent) {
+          toast.error(error.message || 'Failed to load decision state')
+        }
+        return null
+      }
+    },
+    [roomId, setDecisionState]
+  )
+
+  useEffect(() => {
+    let cancelled = false
+
+    const hydrate = async () => {
+      setIsLoading(true)
+      await syncDecisionState()
+      if (!cancelled) {
+        setIsLoading(false)
       }
     }
 
-    fetchAnalysis()
-  }, [phase, items])
+    hydrate()
 
-  // Helper functions to emit events
-  const addItem = (item) => {
-    addDecisionItem(item)
-    if (socket) {
-      socket.emit('decision:add-item', { roomId, item })
+    return () => {
+      cancelled = true
+    }
+  }, [syncDecisionState])
+
+  useEffect(() => {
+    if (!socket || !roomId) return
+
+    const refresh = () => {
+      syncDecisionState({ silent: true })
+    }
+
+    socket.on('decision:set-phase', refresh)
+    socket.on('decision:add-item', refresh)
+    socket.on('decision:remove-item', refresh)
+    socket.on('decision:vote', refresh)
+
+    return () => {
+      socket.off('decision:set-phase', refresh)
+      socket.off('decision:add-item', refresh)
+      socket.off('decision:remove-item', refresh)
+      socket.off('decision:vote', refresh)
+    }
+  }, [socket, roomId, syncDecisionState])
+
+  const addItem = async (payload) => {
+    if (!roomId) return
+
+    setIsMutating(true)
+    try {
+      const state = await addDecisionItem(roomId, payload)
+      setDecisionState(state)
+
+      const latestItem = state?.items?.[state.items.length - 1]
+      if (socket && latestItem) {
+        socket.emit('decision:add-item', {
+          roomId,
+          item: latestItem,
+        })
+      }
+
+      return state
+    } catch (error) {
+      toast.error(error.message || 'Failed to add item')
+      throw error
+    } finally {
+      setIsMutating(false)
     }
   }
 
-  const removeItem = (itemId) => {
-    removeDecisionItem(itemId)
-    if (socket) {
-      socket.emit('decision:remove-item', { roomId, itemId })
+  const removeItem = async (itemId) => {
+    if (!roomId || !itemId) return
+
+    setIsMutating(true)
+    try {
+      const state = await removeDecisionItem(roomId, itemId)
+      setDecisionState(state)
+
+      if (socket) {
+        socket.emit('decision:remove-item', {
+          roomId,
+          itemId,
+        })
+      }
+
+      return state
+    } catch (error) {
+      toast.error(error.message || 'Failed to remove item')
+      throw error
+    } finally {
+      setIsMutating(false)
     }
   }
 
-  const vote = (itemId, userId) => {
-    voteOnItem(itemId, userId)
-    if (socket) {
-      socket.emit('decision:vote', { roomId, itemId, userId })
+  const vote = async (itemId) => {
+    if (!roomId || !itemId) return
+
+    setIsMutating(true)
+    try {
+      const state = await voteDecisionItem(roomId, itemId)
+      setDecisionState(state)
+
+      if (socket) {
+        socket.emit('decision:vote', {
+          roomId,
+          itemId,
+        })
+      }
+
+      return state
+    } catch (error) {
+      toast.error(error.message || 'Failed to vote')
+      throw error
+    } finally {
+      setIsMutating(false)
     }
   }
 
-  const changePhase = (newPhase) => {
-    setDecisionPhase(newPhase)
-    if (socket) {
-      socket.emit('decision:set-phase', { roomId, phase: newPhase })
+  const changePhase = async (newPhase) => {
+    if (!roomId || !newPhase) return
+
+    setIsMutating(true)
+    try {
+      const state = await updateDecisionPhase(roomId, newPhase)
+      setDecisionState(state)
+
+      if (socket) {
+        socket.emit('decision:set-phase', {
+          roomId,
+          phase: newPhase,
+        })
+      }
+
+      return state
+    } catch (error) {
+      toast.error(error.message || 'Failed to change phase')
+      throw error
+    } finally {
+      setIsMutating(false)
     }
   }
 
   return {
     phase,
     items,
+    analysis,
+    isLoading,
+    isMutating,
     addItem,
     removeItem,
     vote,
     changePhase,
+    refreshState: syncDecisionState,
   }
 }
 

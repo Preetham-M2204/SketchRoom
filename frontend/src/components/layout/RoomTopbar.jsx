@@ -6,6 +6,7 @@ import Button from '../ui/Button'
 import { toast } from '../ui/Toast'
 import PresencePills from './PresencePills'
 import ModeIndicator from './ModeIndicator'
+import { copyTextToClipboard } from '../../api/rooms'
 
 /**
  * RoomTopbar Component
@@ -25,11 +26,16 @@ const RoomTopbar = () => {
   const room = useRoomStore((state) => state.room)
   const members = useRoomStore((state) => state.members)
 
-  const handleCopyInviteCode = () => {
-    if (room?.inviteCode) {
-      navigator.clipboard.writeText(room.inviteCode)
+  const handleCopyInviteCode = async () => {
+    if (!room?.inviteCode) return
+
+    const copied = await copyTextToClipboard(room.inviteCode)
+    if (copied) {
       toast.success('Invite code copied!')
+      return
     }
+
+    toast.error('Could not copy invite code')
   }
 
   const handleLeaveRoom = () => {

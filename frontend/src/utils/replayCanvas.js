@@ -14,7 +14,13 @@ import { drawStroke } from './drawStroke'
  * 2. Undo operation → remove last stroke from array → replay remaining
  * 3. Window resize → clear canvas → replay all strokes at new size
  */
-export const replayCanvas = (ctx, strokes, canvasWidth, canvasHeight) => {
+export const replayCanvas = (ctx, strokes, canvasWidth, canvasHeight, viewport = { x: 0, y: 0, zoom: 1 }) => {
+  const zoom = Number.isFinite(viewport?.zoom) ? Math.min(Math.max(viewport.zoom, 0.1), 8) : 1
+  const offsetX = Number.isFinite(viewport?.x) ? viewport.x : 0
+  const offsetY = Number.isFinite(viewport?.y) ? viewport.y : 0
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0)
+
   // Clear entire canvas
   ctx.clearRect(0, 0, canvasWidth, canvasHeight)
 
@@ -22,10 +28,16 @@ export const replayCanvas = (ctx, strokes, canvasWidth, canvasHeight) => {
   ctx.fillStyle = '#F7F4EF' // Canvas surface color from design system
   ctx.fillRect(0, 0, canvasWidth, canvasHeight)
 
+  ctx.save()
+  ctx.setTransform(zoom, 0, 0, zoom, offsetX, offsetY)
+
   // Draw each stroke in order
   strokes.forEach((stroke) => {
     drawStroke(ctx, stroke)
   })
+
+  ctx.restore()
+  ctx.setTransform(1, 0, 0, 1, 0, 0)
 }
 
 /**

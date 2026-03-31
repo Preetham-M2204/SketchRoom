@@ -2,7 +2,7 @@ import { create } from 'zustand'
 
 const useCanvasStore = create((set) => ({
   // State
-  activeTool: 'pen', // 'pen' | 'eraser' | 'select' | 'pan'
+  activeTool: 'pen', // 'pen' | 'eraser' | 'line' | 'rectangle' | 'circle' | 'select' | 'pan'
   color: '#18170F',
   strokeWidth: 2,
   isDrawing: false,

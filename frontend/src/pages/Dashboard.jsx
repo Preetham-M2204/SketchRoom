@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { motion, AnimatePresence } from 'framer-motion'
-import { createRoom, getRooms } from '../api/rooms'
+import { createRoom, deleteRoom, getRooms } from '../api/rooms'
 import useAuthStore from '../stores/useAuthStore'
 import { toast } from '../components/ui/Toast'
 import CustomCursor from '../components/ui/CustomCursor'
@@ -142,6 +142,7 @@ const Dashboard = () => {
   const [showProfileMenu, setShowProfileMenu] = useState(false)
   const [showMobileMenu, setShowMobileMenu] = useState(false)
   const [showMobileSearch, setShowMobileSearch] = useState(false)
+  const [deletingRoomId, setDeletingRoomId] = useState(null)
   const [newRoom, setNewRoom] = useState({
     name: '',
     topic: '',
@@ -191,9 +192,37 @@ const Dashboard = () => {
       setShowModal(false)
       setNewRoom({ name: '', topic: '', mode: 'decision', isPublic: false })
       toast.success('Room created successfully!')
-      navigate(`/room/${room.id}`)
+      navigate(`/room/${room.publicId || room.id}`)
     } catch (error) {
       toast.error('Failed to create room')
+    }
+  }
+
+  const handleDeleteRoom = async (room) => {
+    const roomId = room?.id
+    if (!roomId || deletingRoomId) return
+
+    const isOwner =
+      room?.permissions?.viewerRole === 'owner' ||
+      String(room?.owner?.id || '') === String(user?.id || '')
+
+    if (!isOwner) {
+      toast.error('Only room owners can delete rooms')
+      return
+    }
+
+    const confirmed = window.confirm(`Delete "${room.name || 'this room'}" permanently? This action cannot be undone.`)
+    if (!confirmed) return
+
+    try {
+      setDeletingRoomId(roomId)
+      await deleteRoom(roomId)
+      setRooms((prev) => prev.filter((item) => item.id !== roomId))
+      toast.success('Room deleted')
+    } catch (error) {
+      toast.error(error?.message || 'Failed to delete room')
+    } finally {
+      setDeletingRoomId(null)
     }
   }
 
@@ -446,6 +475,10 @@ const Dashboard = () => {
                 const mode = getModeMeta(room.mode)
                 const participantTokens = getParticipantTokens(room.participants)
                 const PreviewComponent = PREVIEW_MAP[room.mode] || CanvasPreview
+                const isOwner =
+                  room?.permissions?.viewerRole === 'owner' ||
+                  String(room?.owner?.id || '') === String(user?.id || '')
+                const isDeleting = deletingRoomId === room.id
 
                 return (
                   <motion.article
@@ -473,6 +506,20 @@ const Dashboard = () => {
                           </div>
                         )}
                       </div>
+
+                      {isOwner ? (
+                        <button
+                          type="button"
+                          onClick={() => handleDeleteRoom(room)}
+                          disabled={isDeleting}
+                          className="absolute top-3 right-3 z-10 w-8 h-8 rounded-full bg-white/90 border border-[#C0392B]/20 text-[#C0392B] hover:bg-[#C0392B]/8 disabled:opacity-60 disabled:cursor-not-allowed transition-colors flex items-center justify-center"
+                          title="Delete room"
+                        >
+                          <span className={`material-symbols-outlined text-[18px] ${isDeleting ? 'animate-spin' : ''}`}>
+                            {isDeleting ? 'autorenew' : 'delete'}
+                          </span>
+                        </button>
+                      ) : null}
                     </div>
 
                     {/* Info area */}
@@ -501,7 +548,7 @@ const Dashboard = () => {
 
                         {/* Action button */}
                         <button
-                          onClick={() => navigate(`/room/${room.id}`)}
+                          onClick={() => navigate(`/room/${room.publicId || room.id}`)}
                           className={`px-4 py-1.5 text-[12px] font-semibold rounded-full transition-all duration-200 shrink-0 ${
                             room.isLive
                               ? 'bg-[#2A7A4B] text-white hover:bg-[#23693F] shadow-sm'

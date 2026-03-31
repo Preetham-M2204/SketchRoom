@@ -1,147 +1,232 @@
-import { useEffect, useState } from 'react'
-import useModeStore from '../stores/useModeStore'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import {
+  advanceGdSpeaker,
+  endGdRound,
+  getGdState,
+  setGdMicAccess,
+  startGdRound,
+  submitGdSpeakerScore,
+} from '../api/rooms'
 import { getGdSummary } from '../api/ai'
+import useModeStore from '../stores/useModeStore'
 import { toast } from '../components/ui/Toast'
 
-/**
- * useGdRound Hook
- * Manages GD Round mode logic
- *
- * What it does:
- * - Manages speaker queue and turn order
- * - Tracks timer for each speaker (2 minutes per person)
- * - Handles scoring (clarity, content, delivery)
- * - Fetches AI summary from Claude after round
- *
- * GD Round flow:
- * 1. Moderator starts round, sets speaker order
- * 2. Each speaker gets 2 minutes
- * 3. Timer auto-advances to next speaker
- * 4. Moderator scores each speaker after their turn
- * 5. AI generates summary at end
- *
- * Usage:
- * const { currentSpeaker, timeRemaining, scores } = useGdRound(socket, roomId, userId)
- *
- * @param {Socket} socket - Socket.io instance
- * @param {string} roomId - Current room ID
- * @param {string} userId - Current user ID
- */
-
-const useGdRound = (socket, roomId, userId) => {
+const useGdRound = (socket, roomId, userId, viewerRole = 'member') => {
   const speakers = useModeStore((state) => state.gd.speakers)
   const currentSpeakerIndex = useModeStore((state) => state.gd.currentSpeakerIndex)
   const scores = useModeStore((state) => state.gd.scores)
+  const micOverrideUserIds = useModeStore((state) => state.gd.micOverrideUserIds)
   const isActive = useModeStore((state) => state.gd.isActive)
   const summary = useModeStore((state) => state.gd.summary)
-
-  const setSpeakers = useModeStore((state) => state.setSpeakers)
-  const setCurrentSpeakerIndex = useModeStore((state) => state.setCurrentSpeakerIndex)
+  const setGdState = useModeStore((state) => state.setGdState)
   const updateSpeakerTime = useModeStore((state) => state.updateSpeakerTime)
-  const setGdActive = useModeStore((state) => state.setGdActive)
-  const updateScore = useModeStore((state) => state.updateScore)
-  const setGdSummary = useModeStore((state) => state.setGdSummary)
 
-  const [timerInterval, setTimerInterval] = useState(null)
+  const [isLoading, setIsLoading] = useState(true)
+  const [isMutating, setIsMutating] = useState(false)
+  const isModerator = viewerRole === 'owner' || viewerRole === 'moderator'
 
-  const currentSpeaker = speakers[currentSpeakerIndex] || null
+  const syncGdState = useCallback(
+    async ({ silent = false } = {}) => {
+      if (!roomId) return null
 
-  // Socket event listeners
+      try {
+        const state = await getGdState(roomId)
+        setGdState(state)
+        return state
+      } catch (error) {
+        if (!silent) {
+          toast.error(error.message || 'Failed to load GD state')
+        }
+        return null
+      }
+    },
+    [roomId, setGdState]
+  )
+
+  useEffect(() => {
+    let cancelled = false
+
+    const hydrate = async () => {
+      setIsLoading(true)
+      await syncGdState()
+      if (!cancelled) {
+        setIsLoading(false)
+      }
+    }
+
+    hydrate()
+
+    return () => {
+      cancelled = true
+    }
+  }, [syncGdState])
+
   useEffect(() => {
     if (!socket || !roomId) return
 
-    // Round started
-    socket.on('gd:start-round', ({ speakers }) => {
-      setSpeakers(speakers)
-      setGdActive(true)
-      setCurrentSpeakerIndex(0)
-      toast.success('GD Round started')
-    })
+    const refresh = () => {
+      syncGdState({ silent: true })
+    }
 
-    // Next speaker
-    socket.on('gd:next-speaker', ({ index }) => {
-      setCurrentSpeakerIndex(index)
-      if (speakers[index]) {
-        toast.info(`${speakers[index].name}'s turn`)
-      }
-    })
+    const handleTimerTick = ({ userId: speakerUserId, timeRemaining }) => {
+      updateSpeakerTime(speakerUserId, timeRemaining)
+    }
 
-    // Score submitted
-    socket.on('gd:submit-score', ({ userId, scores }) => {
-      updateScore(userId, scores)
-    })
-
-    // Timer tick
-    socket.on('gd:timer-tick', ({ userId, timeRemaining }) => {
-      updateSpeakerTime(userId, timeRemaining)
-    })
+    socket.on('gd:start-round', refresh)
+    socket.on('gd:next-speaker', refresh)
+    socket.on('gd:submit-score', refresh)
+    socket.on('gd:end-round', refresh)
+    socket.on('gd:set-mic-access', refresh)
+    socket.on('gd:timer-tick', handleTimerTick)
 
     return () => {
-      socket.off('gd:start-round')
-      socket.off('gd:next-speaker')
-      socket.off('gd:submit-score')
-      socket.off('gd:timer-tick')
+      socket.off('gd:start-round', refresh)
+      socket.off('gd:next-speaker', refresh)
+      socket.off('gd:submit-score', refresh)
+      socket.off('gd:end-round', refresh)
+      socket.off('gd:set-mic-access', refresh)
+      socket.off('gd:timer-tick', handleTimerTick)
     }
-  }, [socket, roomId, speakers])
+  }, [socket, roomId, syncGdState, updateSpeakerTime])
 
-  // Auto-advance to next speaker when time runs out
-  useEffect(() => {
-    if (!currentSpeaker || currentSpeaker.timeRemaining > 0) return
+  const currentSpeaker = useMemo(() => {
+    return speakers[currentSpeakerIndex] || null
+  }, [speakers, currentSpeakerIndex])
 
-    // Time's up, move to next speaker
-    const nextIndex = currentSpeakerIndex + 1
+  const startRound = async (speakerList) => {
+    if (!roomId) return
 
-    if (nextIndex < speakers.length) {
-      setCurrentSpeakerIndex(nextIndex)
-      if (socket) {
-        socket.emit('gd:next-speaker', { roomId, index: nextIndex })
-      }
-    } else {
-      // All speakers done, fetch summary
-      endRound()
-    }
-  }, [currentSpeaker?.timeRemaining])
-
-  // Fetch AI summary at end of round
-  const endRound = async () => {
-    setGdActive(false)
-    toast.info('Fetching GD summary...')
-
+    setIsMutating(true)
     try {
-      const summaryText = await getGdSummary({ speakers, scores })
-      setGdSummary(summaryText)
-      toast.success('Summary generated')
-    } catch (error) {
-      toast.error('Failed to generate summary')
-      console.error(error)
-    }
-  }
+      const state = await startGdRound(roomId, speakerList)
+      setGdState(state)
 
-  // Helper functions
-  const startRound = (speakerList) => {
-    setSpeakers(speakerList)
-    setGdActive(true)
-    setCurrentSpeakerIndex(0)
-
-    if (socket) {
-      socket.emit('gd:start-round', { roomId, speakers: speakerList })
-    }
-  }
-
-  const nextSpeaker = () => {
-    const nextIndex = currentSpeakerIndex + 1
-    if (nextIndex < speakers.length) {
-      setCurrentSpeakerIndex(nextIndex)
       if (socket) {
-        socket.emit('gd:next-speaker', { roomId, index: nextIndex })
+        socket.emit('gd:start-round', {
+          roomId,
+          speakers: state.speakers || speakerList,
+        })
       }
+
+      return state
+    } catch (error) {
+      toast.error(error.message || 'Failed to start GD round')
+      throw error
+    } finally {
+      setIsMutating(false)
     }
   }
 
-  const submitScore = (speakerUserId, scoreData) => {
-    updateScore(speakerUserId, scoreData)
-    if (socket) {
-      socket.emit('gd:submit-score', { roomId, userId: speakerUserId, scores: scoreData })
+  const nextSpeaker = async () => {
+    if (!roomId || speakers.length === 0) return null
+
+    const nextIndex = currentSpeakerIndex + 1
+    if (nextIndex >= speakers.length) {
+      return null
+    }
+
+    setIsMutating(true)
+    try {
+      const state = await advanceGdSpeaker(roomId, nextIndex)
+      setGdState(state)
+
+      if (socket) {
+        socket.emit('gd:next-speaker', {
+          roomId,
+          index: state.currentSpeakerIndex,
+        })
+      }
+
+      return state
+    } catch (error) {
+      toast.error(error.message || 'Failed to advance speaker')
+      throw error
+    } finally {
+      setIsMutating(false)
+    }
+  }
+
+  const submitScore = async (speakerUserId, scoreData) => {
+    if (!roomId || !speakerUserId) return
+
+    setIsMutating(true)
+    try {
+      const state = await submitGdSpeakerScore(roomId, speakerUserId, scoreData)
+      setGdState(state)
+
+      if (socket) {
+        socket.emit('gd:submit-score', {
+          roomId,
+          userId: speakerUserId,
+          scores: scoreData,
+        })
+      }
+
+      return state
+    } catch (error) {
+      toast.error(error.message || 'Failed to submit score')
+      throw error
+    } finally {
+      setIsMutating(false)
+    }
+  }
+
+  const setSpeakerMicAccess = async (targetUserId, enabled) => {
+    if (!roomId || !targetUserId) return
+
+    setIsMutating(true)
+    try {
+      const state = await setGdMicAccess(roomId, targetUserId, enabled)
+      setGdState(state)
+
+      if (socket) {
+        socket.emit('gd:set-mic-access', {
+          roomId,
+          userId: targetUserId,
+          enabled: Boolean(enabled),
+        })
+      }
+
+      return state
+    } catch (error) {
+      toast.error(error.message || 'Failed to update mic access')
+      throw error
+    } finally {
+      setIsMutating(false)
+    }
+  }
+
+  const endRound = async () => {
+    if (!roomId) return
+
+    setIsMutating(true)
+    try {
+      let summaryText = ''
+      try {
+        summaryText = await getGdSummary({
+          speakers,
+          scores,
+        })
+      } catch {
+        // Fallback summary is generated by backend if AI call fails.
+      }
+
+      const state = await endGdRound(roomId, summaryText || undefined)
+      setGdState(state)
+
+      if (socket) {
+        socket.emit('gd:end-round', {
+          roomId,
+          summary: state?.summary || summaryText || undefined,
+        })
+      }
+
+      return state
+    } catch (error) {
+      toast.error(error.message || 'Failed to end GD round')
+      throw error
+    } finally {
+      setIsMutating(false)
     }
   }
 
@@ -150,13 +235,18 @@ const useGdRound = (socket, roomId, userId) => {
     currentSpeaker,
     currentSpeakerIndex,
     scores,
+    micOverrideUserIds,
     isActive,
     summary,
-    isModerator: true, // TODO: Check if user is room owner
+    isLoading,
+    isMutating,
+    isModerator,
     startRound,
     nextSpeaker,
     submitScore,
+    setSpeakerMicAccess,
     endRound,
+    refreshState: syncGdState,
   }
 }
 

@@ -1,401 +1,475 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { motion, AnimatePresence } from 'framer-motion'
+import { buildRoomShareLink, copyTextToClipboard, isLocalShareOrigin } from '../../api/rooms'
 import useDecision from '../../hooks/useDecision'
+import useRoomStore from '../../stores/useRoomStore'
+import { toast } from '../ui/Toast'
+import JoinRequestsMenu from '../layout/JoinRequestsMenu'
 
-/**
- * DecisionBoard Component
- * SWOT-style decision board matching the Stitch design reference
- * Features: colored sticky notes, large quadrant watermark letters,
- * sidebar chat, bottom toolbar, responsive mobile layout
- */
+const PHASES = [
+  { id: 'brainstorm', label: 'Brainstorm' },
+  { id: 'voting', label: 'Voting' },
+  { id: 'analysis', label: 'Analysis' },
+]
 
-const QUADRANT_CONFIG = {
-  strength: {
-    label: 'STRENGTHS',
-    letter: 'S',
-    letterColor: 'rgba(42,122,75,0.08)',
-    borderColor: '#2A7A4B',
-    noteColor: '#d4f5d4',
-    noteBorder: '#2A7A4B',
-  },
-  weakness: {
-    label: 'WEAKNESSES',
-    letter: 'W',
-    letterColor: 'rgba(212,66,10,0.06)',
-    borderColor: '#D4420A',
-    noteColor: '#ffe4d4',
-    noteBorder: '#D4420A',
-  },
-  opportunity: {
-    label: 'OPPORTUNITIES',
-    letter: 'O',
-    letterColor: 'rgba(30,95,116,0.06)',
-    borderColor: '#1E5F74',
-    noteColor: '#d4eef5',
-    noteBorder: '#1E5F74',
-  },
-  threat: {
-    label: 'THREATS',
-    letter: 'T',
-    letterColor: 'rgba(192,57,43,0.06)',
-    borderColor: '#C0392B',
-    noteColor: '#fdd4d4',
-    noteBorder: '#C0392B',
-  },
+const ITEM_TYPE_OPTIONS = [
+  { value: 'strength', label: 'Strength' },
+  { value: 'weakness', label: 'Weakness' },
+  { value: 'opportunity', label: 'Opportunity' },
+  { value: 'threat', label: 'Threat' },
+  { value: 'pro', label: 'Pro' },
+  { value: 'con', label: 'Con' },
+  { value: 'idea', label: 'Idea' },
+  { value: 'question', label: 'Question' },
+]
+
+const TYPE_UI = {
+  strength: { label: 'Strengths', chip: 'bg-[#2A7A4B]/10 text-[#2A7A4B]' },
+  weakness: { label: 'Weaknesses', chip: 'bg-[#D4420A]/10 text-[#D4420A]' },
+  opportunity: { label: 'Opportunities', chip: 'bg-[#1E5F74]/10 text-[#1E5F74]' },
+  threat: { label: 'Threats', chip: 'bg-[#C0392B]/10 text-[#C0392B]' },
+  pro: { label: 'Pros', chip: 'bg-[#2A7A4B]/10 text-[#2A7A4B]' },
+  con: { label: 'Cons', chip: 'bg-[#D4420A]/10 text-[#D4420A]' },
+  idea: { label: 'Ideas', chip: 'bg-[#8E44AD]/10 text-[#8E44AD]' },
+  question: { label: 'Questions', chip: 'bg-[#C4871A]/10 text-[#C4871A]' },
+  other: { label: 'Other', chip: 'bg-[#18170F]/8 text-[#18170F]/70' },
 }
 
-const DecisionBoard = ({ socket, roomId, userId, room }) => {
+function formatMessageTime(timestamp) {
+  if (!timestamp) return ''
+
+  try {
+    return new Date(timestamp).toLocaleTimeString([], {
+      hour: '2-digit',
+      minute: '2-digit',
+    })
+  } catch {
+    return ''
+  }
+}
+
+const DecisionBoard = ({ socket, roomId, userId, room, requestsMenu = null }) => {
   const navigate = useNavigate()
-  const { phase, items, addItem, vote, changePhase } = useDecision(socket, roomId)
+  const {
+    phase,
+    items,
+    analysis,
+    isLoading,
+    isMutating,
+    addItem,
+    removeItem,
+    vote,
+    changePhase,
+  } = useDecision(socket, roomId)
 
-  const [message, setMessage] = useState('')
-  const [activePhase, setActivePhase] = useState('brainstorm')
-  const [sidebarTab, setSidebarTab] = useState('chat')
-  const [showSidebar, setShowSidebar] = useState(true)
+  const members = useRoomStore((state) => state.members)
+  const messages = useRoomStore((state) => state.messages)
 
-  const swotItems = {
-    strength: [
-      { id: '01', text: 'High performance engine core and sub-microsecond latency.' },
-      { id: '02', text: 'Strong existing user base in financial sector.' },
-    ],
-    weakness: [
-      { id: '08', text: 'Steep learning curve for non-technical admins.' },
-    ],
-    opportunity: [
-      { id: '12', text: 'Expanding into the APAC region next quarter.' },
-    ],
-    threat: [
-      { id: '21', text: 'Increased competitor funding in Q4.' },
-    ],
+  const [text, setText] = useState('')
+  const [itemType, setItemType] = useState('idea')
+  const [chatMessage, setChatMessage] = useState('')
+  const [showDiscussion, setShowDiscussion] = useState(() => {
+    if (typeof window === 'undefined') return true
+    return window.innerWidth >= 1024
+  })
+
+  const isHost = room?.owner?.id === userId
+
+  const participantList = useMemo(() => {
+    const map = new Map()
+
+    ;(room?.members || []).forEach((member) => {
+      const id = String(member?.id || member?.userId || '')
+      if (!id) return
+      map.set(id, { id, name: member?.name || 'Member' })
+    })
+
+    ;(members || []).forEach((member) => {
+      const id = String(member?.userId || member?.id || '')
+      if (!id) return
+      map.set(id, { id, name: member?.name || 'Member' })
+    })
+
+    if (userId) {
+      const normalizedUserId = String(userId)
+      if (!map.has(normalizedUserId)) {
+        map.set(normalizedUserId, {
+          id: normalizedUserId,
+          name: 'You',
+        })
+      }
+    }
+
+    return Array.from(map.values())
+  }, [room?.members, members, userId])
+
+  const groupedItems = useMemo(() => {
+    return items.reduce((groups, item) => {
+      const key = TYPE_UI[item.type] ? item.type : 'other'
+      if (!groups[key]) {
+        groups[key] = []
+      }
+      groups[key].push(item)
+      return groups
+    }, {})
+  }, [items])
+
+  const orderedGroupKeys = useMemo(() => {
+    const preferred = ['strength', 'weakness', 'opportunity', 'threat', 'pro', 'con', 'idea', 'question', 'other']
+    return preferred.filter((key) => groupedItems[key]?.length)
+  }, [groupedItems])
+
+  const recentMessages = useMemo(() => {
+    return (messages || []).slice(-40)
+  }, [messages])
+
+  const handleAddItem = async (event) => {
+    event.preventDefault()
+    const trimmed = text.trim()
+    if (!trimmed) return
+
+    try {
+      await addItem({
+        text: trimmed,
+        type: itemType,
+      })
+      setText('')
+    } catch {
+      // Error toasts handled in hook.
+    }
   }
 
-  const chatMessages = [
-    { user: 'SARAH M.', time: '10:42 AM', text: 'Should we move item #08 to threats? It feels more external than internal.' },
-    { user: 'MARCUS T.', time: '10:44 AM', text: "Agreed. Let's get a consensus on that during the voting phase." },
-    { user: 'SYSTEM', time: '10:45 AM', text: 'Marcus T. joined the session', isSystem: true },
-  ]
+  const handlePhaseChange = async (nextPhase) => {
+    if (nextPhase === phase) return
+    try {
+      await changePhase(nextPhase)
+    } catch {
+      // Error toasts handled in hook.
+    }
+  }
 
-  const StickyNote = ({ item, config, rotation = 0 }) => (
-    <motion.div
-      initial={{ opacity: 0, y: 10 }}
-      animate={{ opacity: 1, y: 0 }}
-      className="relative p-4 rounded-md shadow-sm cursor-pointer hover:shadow-md hover:-translate-y-0.5 transition-all duration-200"
-      style={{
-        backgroundColor: config.noteColor,
-        borderLeft: `3px solid ${config.noteBorder}`,
-        transform: `rotate(${rotation}deg)`,
-      }}
-    >
-      <p className="text-sm text-[#18170F] leading-relaxed">{item.text}</p>
-      <span className="inline-block mt-2 text-[11px] font-mono text-[#18170F]/40 bg-white/60 px-2 py-0.5 rounded">
-        #{item.id}
-      </span>
-    </motion.div>
-  )
+  const handleSendMessage = (event) => {
+    event.preventDefault()
+    const trimmed = chatMessage.trim()
+    if (!trimmed) return
 
-  const QuadrantSection = ({ type, items: quadrantItems, position }) => {
-    const config = QUADRANT_CONFIG[type]
-    const isRight = position === 'topRight' || position === 'bottomRight'
-    const isBottom = position === 'bottomLeft' || position === 'bottomRight'
+    if (!socket) {
+      toast.error('Discussion channel is not connected yet')
+      return
+    }
 
-    return (
-      <div
-        className="relative p-4 sm:p-6 min-h-[200px] sm:min-h-[280px]"
-        style={{
-          borderRight: !isRight ? '1px solid rgba(24,23,15,0.08)' : 'none',
-          borderBottom: !isBottom ? '1px solid rgba(24,23,15,0.08)' : 'none',
-        }}
-      >
-        {/* Large watermark letter */}
-        <div
-          className="absolute select-none pointer-events-none font-bold"
-          style={{
-            fontSize: 'clamp(80px, 12vw, 160px)',
-            color: config.letterColor,
-            top: isBottom ? 'auto' : '-10px',
-            bottom: isBottom ? '-10px' : 'auto',
-            left: !isRight ? '-5px' : 'auto',
-            right: isRight ? '-5px' : 'auto',
-            lineHeight: 1,
-          }}
-        >
-          {config.letter}
-        </div>
-
-        {/* Quadrant header */}
-        <div className={`flex items-center gap-2 mb-4 ${isRight ? 'justify-end' : ''}`}>
-          {!isRight && (
-            <span
-              className="w-1.5 h-6 rounded-full"
-              style={{ backgroundColor: config.borderColor }}
-            />
-          )}
-          <h2 className="text-[13px] sm:text-[15px] font-semibold text-[#18170F]/30 tracking-wider uppercase">
-            {config.label}
-          </h2>
-          {isRight && (
-            <span
-              className="w-1.5 h-6 rounded-full"
-              style={{ backgroundColor: config.borderColor }}
-            />
-          )}
-        </div>
-
-        {/* Sticky notes */}
-        <div className="space-y-3 relative z-10">
-          {quadrantItems.map((item, i) => (
-            <StickyNote
-              key={item.id}
-              item={item}
-              config={config}
-              rotation={i % 2 === 0 ? -1 : 2}
-            />
-          ))}
-        </div>
-      </div>
+    socket.emit(
+      'chat:message',
+      {
+        roomId,
+        text: trimmed,
+        timestamp: Date.now(),
+      },
+      (ack) => {
+        if (ack && ack.ok === false) {
+          toast.error(ack.message || 'Failed to send message')
+        }
+      }
     )
+
+    setChatMessage('')
+  }
+
+  const handleShare = async () => {
+    if (!isHost) {
+      toast.warning('Only the host can invite guests to this room')
+      return
+    }
+
+    const roomUrl = buildRoomShareLink(room)
+    if (!roomUrl) {
+      toast.error('Share link is unavailable for this room')
+      return
+    }
+
+    const roomCode = room?.publicId || room?.inviteCode || room?.id
+    const localOriginTip = isLocalShareOrigin() && !import.meta.env.VITE_SHARE_BASE_URL
+      ? '\nTip: Set VITE_SHARE_BASE_URL to your LAN URL for cross-device same-network access.'
+      : ''
+
+    const shareText = `Join my SketchRoom decision room\nRoom: ${roomUrl}${roomCode ? `\nRoom code: ${roomCode}` : ''}\nAdmins need to approve join requests.${localOriginTip}`
+
+    const copied = await copyTextToClipboard(shareText)
+    if (copied) {
+      toast.success('Invite copied to clipboard')
+      return
+    }
+
+    toast.error('Could not copy invite details')
   }
 
   return (
-    <div className="h-screen w-screen flex flex-col bg-[#fdf9f1] font-body overflow-hidden">
-      {/* ━━ Header ━━ */}
-      <header className="h-[48px] bg-[#2C2C28] px-4 sm:px-6 flex items-center justify-between shrink-0">
-        <div className="flex items-center gap-3">
+    <div className="h-screen w-screen flex flex-col bg-[#F7F4EF] font-body overflow-hidden">
+      <header className="min-h-[52px] bg-[#2C2C28] px-3 sm:px-6 py-2 flex flex-wrap items-center justify-between gap-2 shrink-0">
+        <div className="flex items-center gap-2 sm:gap-3 min-w-0 flex-1">
           <button
             onClick={() => navigate('/dashboard')}
-            className="text-[#EDE9E0]/60 hover:text-[#EDE9E0] transition-colors"
+            className="text-[#EDE9E0]/65 hover:text-[#EDE9E0] shrink-0"
           >
             <span className="material-symbols-outlined text-[20px]">arrow_back</span>
           </button>
-          <h1 className="text-[15px] sm:text-[17px] font-bold text-[#EDE9E0] tracking-tight">
-            Collaborative Canvas
-          </h1>
-          <span className="hidden sm:inline-flex px-2.5 py-[2px] text-[10px] font-bold tracking-wider text-white bg-[#D4420A] rounded-full uppercase">
-            Decision Board
-          </span>
+
+          <div className="min-w-0">
+            <h1 className="text-[14px] sm:text-[15px] font-semibold text-[#EDE9E0] truncate">
+              {room?.name || 'Decision Room'}
+            </h1>
+            <p className="text-[11px] text-[#EDE9E0]/55 truncate">
+              Backend-driven decision workflow
+            </p>
+          </div>
         </div>
 
-        {/* Center tabs */}
-        <nav className="hidden sm:flex items-center gap-1">
-          {['Canvas', 'Timeline', 'History'].map((tab, i) => (
-            <a
-              key={tab}
-              href="#"
-              className={`px-3 py-1 text-[13px] font-medium transition-colors ${
-                i === 0
-                  ? 'text-[#D4420A] border-b-2 border-[#D4420A]'
-                  : 'text-[#EDE9E0]/50 hover:text-[#EDE9E0]/80'
-              }`}
-            >
-              {tab}
-            </a>
-          ))}
-        </nav>
-
-        {/* Right: Avatars + Share */}
-        <div className="flex items-center gap-2">
-          <div className="hidden sm:flex -space-x-2">
-            {[...Array(3)].map((_, i) => (
-              <div
-                key={i}
-                className="w-7 h-7 rounded-full bg-[#EDE9E0]/15 border-2 border-[#2C2C28]"
-              />
-            ))}
-            <div className="w-7 h-7 rounded-full bg-[#D4420A]/20 border-2 border-[#2C2C28] flex items-center justify-center text-[10px] font-bold text-[#D4420A]">
-              +4
-            </div>
-          </div>
-          <button className="px-3 py-1.5 bg-[#D4420A] text-white text-[12px] font-semibold rounded-md hover:bg-[#B33508] transition-colors flex items-center gap-1">
-            <span className="material-symbols-outlined text-[14px]">share</span>
-            <span className="hidden sm:inline">Share</span>
-          </button>
-          <button className="text-[#EDE9E0]/50 hover:text-[#EDE9E0] p-1">
-            <span className="material-symbols-outlined text-[20px]">settings</span>
-          </button>
-
-          {/* Mobile sidebar toggle */}
+        <div className="flex items-center justify-end gap-2 w-full sm:w-auto">
           <button
-            onClick={() => setShowSidebar(!showSidebar)}
-            className="lg:hidden text-[#EDE9E0]/50 hover:text-[#EDE9E0] p-1"
+            onClick={() => setShowDiscussion((previous) => !previous)}
+            className="lg:hidden px-2.5 py-1.5 rounded-md bg-[#EDE9E0]/10 text-[#EDE9E0] text-[11px] font-semibold"
           >
-            <span className="material-symbols-outlined text-[20px]">
-              {showSidebar ? 'right_panel_close' : 'right_panel_open'}
-            </span>
+            {showDiscussion ? 'Hide Chat' : 'Discussion'}
           </button>
+
+          {requestsMenu ? <JoinRequestsMenu {...requestsMenu} /> : null}
+
+          <span className="hidden sm:inline text-[11px] px-2 py-1 rounded bg-[#EDE9E0]/10 text-[#EDE9E0]/85">
+            {participantList.length} participants
+          </span>
+
+          <button
+            onClick={handleShare}
+            className={`px-3 py-1.5 rounded-md text-[12px] font-semibold text-white ${
+              isHost ? 'bg-[#D4420A] hover:bg-[#B33508]' : 'bg-[#8B8178]'
+            }`}
+          >
+            {isHost ? 'Share' : 'Invite Locked'}
+          </button>
+
+          <span className="text-[11px] px-2 py-1 rounded bg-[#D4420A]/20 text-[#FDE7DC] uppercase tracking-wider font-semibold">
+            {phase}
+          </span>
         </div>
       </header>
 
-      <div className="flex flex-1 overflow-hidden">
-        {/* ━━ Main Canvas ━━ */}
-        <main className="flex-1 flex flex-col overflow-hidden relative">
-          {/* Phase tabs */}
-          <div className="flex items-center gap-1 px-4 sm:px-6 py-3 border-b border-[#18170F]/6 bg-[#fdf9f1]">
-            {[
-              { id: 'brainstorm', label: 'INPUT' },
-              { id: 'voting', label: 'VOTING' },
-              { id: 'analysis', label: 'SUMMARY' },
-            ].map((p) => (
-              <button
-                key={p.id}
-                onClick={() => setActivePhase(p.id)}
-                className={`px-4 py-1.5 text-[11px] font-bold tracking-wider rounded-full transition-all ${
-                  activePhase === p.id
-                    ? 'bg-[#D4420A] text-white'
-                    : 'text-[#18170F]/40 hover:text-[#18170F]/60 hover:bg-[#18170F]/5'
-                }`}
-              >
-                {p.label}
-              </button>
-            ))}
-          </div>
-
-          {/* SWOT Grid */}
-          <div className="flex-1 overflow-auto">
-            <div className="grid grid-cols-1 sm:grid-cols-2 min-h-full">
-              <QuadrantSection type="strength" items={swotItems.strength} position="topLeft" />
-              <QuadrantSection type="weakness" items={swotItems.weakness} position="topRight" />
-              <QuadrantSection type="opportunity" items={swotItems.opportunity} position="bottomLeft" />
-              <QuadrantSection type="threat" items={swotItems.threat} position="bottomRight" />
-            </div>
-          </div>
-
-          {/* Bottom Toolbar */}
-          <div className="absolute bottom-4 sm:bottom-6 left-1/2 -translate-x-1/2 flex items-center gap-0.5 bg-[#2C2C28] rounded-2xl px-2 py-1.5 shadow-xl z-20">
-            {[
-              { icon: 'near_me', label: 'Select', active: true },
-              { icon: 'edit', label: 'Draw' },
-              { icon: 'sticky_note_2', label: 'Sticky' },
-              { icon: 'category', label: 'Shape' },
-              { icon: 'title', label: 'Text' },
-            ].map((tool) => (
-              <button
-                key={tool.icon}
-                className={`flex flex-col items-center gap-0.5 px-3 py-2 rounded-xl transition-colors ${
-                  tool.active
-                    ? 'bg-[#D4420A] text-white'
-                    : 'text-[#EDE9E0]/60 hover:text-[#EDE9E0] hover:bg-white/10'
-                }`}
-              >
-                <span className="material-symbols-outlined text-[20px]">{tool.icon}</span>
-                <span className="text-[9px] font-medium tracking-wide">{tool.label}</span>
-              </button>
-            ))}
-          </div>
-        </main>
-
-        {/* ━━ Right Sidebar ━━ */}
-        <AnimatePresence>
-          {showSidebar && (
-            <motion.aside
-              initial={{ width: 0, opacity: 0 }}
-              animate={{ width: 'auto', opacity: 1 }}
-              exit={{ width: 0, opacity: 0 }}
-              className="w-[280px] sm:w-[300px] bg-[#FEFCF8] border-l border-[#18170F]/8 flex flex-col shrink-0 overflow-hidden"
-            >
-              {/* Project info */}
-              <div className="p-4 border-b border-[#18170F]/6">
-                <div className="flex items-center gap-3">
-                  <div className="w-10 h-10 rounded-lg bg-[#D4420A] flex items-center justify-center text-white font-bold text-sm">
-                    PA
-                  </div>
-                  <div>
-                    <h3 className="font-semibold text-sm text-[#18170F]">Project Canvas</h3>
-                    <p className="text-xs text-[#6A6558]">Collaborative Mode</p>
-                  </div>
-                </div>
-                <button className="w-full mt-3 py-2 bg-[#D4420A] text-white text-[12px] font-semibold rounded-lg hover:bg-[#B33508] transition-colors">
-                  Invite Member
-                </button>
-              </div>
-
-              {/* Sidebar tabs */}
-              <div className="flex border-b border-[#18170F]/6">
-                {[
-                  { id: 'chat', icon: 'chat_bubble', label: 'Chat' },
-                  { id: 'participants', icon: 'group', label: 'Participants' },
-                  { id: 'agenda', icon: 'format_list_bulleted', label: 'Agenda' },
-                  { id: 'layers', icon: 'layers', label: 'Layers' },
-                ].map((tab) => (
+      <main className="flex-1 overflow-y-auto px-3 sm:px-6 py-3 sm:py-5">
+        <div className={`grid gap-4 ${showDiscussion ? 'xl:grid-cols-[minmax(0,1fr)_320px]' : 'grid-cols-1'}`}>
+          <section className="min-w-0">
+            <section className="bg-white border border-[#18170F]/10 rounded-2xl p-3 sm:p-4 shadow-sm mb-4">
+              <div className="flex items-center gap-2 overflow-x-auto pb-1">
+                {PHASES.map((entry) => (
                   <button
-                    key={tab.id}
-                    onClick={() => setSidebarTab(tab.id)}
-                    className={`flex-1 flex flex-col items-center gap-1 py-2.5 text-[10px] font-medium transition-colors ${
-                      sidebarTab === tab.id
-                        ? 'text-[#D4420A] border-b-2 border-[#D4420A]'
-                        : 'text-[#18170F]/35 hover:text-[#18170F]/60'
+                    key={entry.id}
+                    onClick={() => handlePhaseChange(entry.id)}
+                    disabled={isMutating}
+                    className={`px-3 py-1.5 rounded-full text-[12px] font-semibold whitespace-nowrap transition-colors ${
+                      phase === entry.id
+                        ? 'bg-[#D4420A] text-white'
+                        : 'bg-[#18170F]/6 text-[#18170F]/70 hover:bg-[#18170F]/10'
                     }`}
                   >
-                    <span className="material-symbols-outlined text-[18px]">{tab.icon}</span>
-                    {tab.label}
+                    {entry.label}
                   </button>
                 ))}
-              </div>
 
-              {/* Chat messages */}
-              <div className="flex-1 overflow-y-auto p-4 space-y-4">
-                {chatMessages.map((msg, i) => (
-                  <div key={i}>
-                    <div className="flex items-center gap-2 mb-1">
-                      <span className={`text-[11px] font-bold tracking-wider ${msg.isSystem ? 'text-[#D4420A]' : 'text-[#18170F]'}`}>
-                        {msg.user}
-                      </span>
-                      <span className="text-[11px] text-[#A09890]">• {msg.time}</span>
+                <span className="ml-auto hidden sm:inline text-[11px] text-[#18170F]/45 whitespace-nowrap">
+                  {items.length} item{items.length === 1 ? '' : 's'}
+                </span>
+              </div>
+            </section>
+
+            <section className="bg-white border border-[#18170F]/10 rounded-2xl p-3 sm:p-4 shadow-sm mb-4">
+              <form className="grid grid-cols-1 sm:grid-cols-[1fr_170px_auto] gap-2" onSubmit={handleAddItem}>
+                <input
+                  type="text"
+                  value={text}
+                  onChange={(event) => setText(event.target.value)}
+                  placeholder="Add a new decision point..."
+                  className="w-full px-3 py-2 rounded-lg border border-[#18170F]/15 text-[14px] text-[#18170F] placeholder:text-[#18170F]/35 focus:border-[#D4420A]/40 outline-none"
+                />
+
+                <select
+                  value={itemType}
+                  onChange={(event) => setItemType(event.target.value)}
+                  className="px-3 py-2 rounded-lg border border-[#18170F]/15 text-[14px] text-[#18170F] focus:border-[#D4420A]/40 outline-none bg-white"
+                >
+                  {ITEM_TYPE_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+
+                <button
+                  type="submit"
+                  disabled={!text.trim() || isMutating}
+                  className="px-4 py-2 rounded-lg bg-[#D4420A] text-white text-[13px] font-semibold hover:bg-[#B33508] disabled:opacity-60 disabled:cursor-not-allowed"
+                >
+                  Add
+                </button>
+              </form>
+            </section>
+
+            {isLoading ? (
+              <div className="bg-white border border-[#18170F]/10 rounded-2xl p-8 text-center text-[#18170F]/60">
+                Loading decision state...
+              </div>
+            ) : null}
+
+            {!isLoading && orderedGroupKeys.length === 0 ? (
+              <div className="bg-white border border-[#18170F]/10 rounded-2xl p-8 text-center">
+                <h3 className="text-[16px] font-semibold text-[#18170F] mb-2">No decision inputs yet</h3>
+                <p className="text-[13px] text-[#18170F]/60">
+                  Start by adding strengths, risks, pros, or open questions.
+                </p>
+              </div>
+            ) : null}
+
+            {!isLoading && orderedGroupKeys.length > 0 ? (
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                {orderedGroupKeys.map((groupKey) => {
+                  const style = TYPE_UI[groupKey] || TYPE_UI.other
+
+                  return (
+                    <section
+                      key={groupKey}
+                      className="bg-white border border-[#18170F]/10 rounded-2xl p-3 sm:p-4 shadow-sm"
+                    >
+                      <div className="flex items-center justify-between mb-3">
+                        <span className={`inline-flex items-center px-2 py-1 rounded-full text-[11px] font-semibold ${style.chip}`}>
+                          {style.label}
+                        </span>
+                        <span className="text-[11px] text-[#18170F]/45">
+                          {groupedItems[groupKey].length} item{groupedItems[groupKey].length === 1 ? '' : 's'}
+                        </span>
+                      </div>
+
+                      <div className="space-y-2">
+                        {groupedItems[groupKey].map((item) => {
+                          const hasVoted = item.votes?.includes(userId)
+
+                          return (
+                            <article
+                              key={item.id}
+                              className="border border-[#18170F]/10 rounded-xl p-3 bg-[#FDFCF9]"
+                            >
+                              <p className="text-[13px] text-[#18170F] leading-relaxed">{item.text}</p>
+                              <div className="mt-2 flex flex-wrap items-center gap-2">
+                                <button
+                                  onClick={() => vote(item.id)}
+                                  disabled={isMutating || hasVoted}
+                                  className={`px-2.5 py-1 rounded-full text-[11px] font-semibold ${
+                                    hasVoted
+                                      ? 'bg-[#2A7A4B]/15 text-[#2A7A4B]'
+                                      : 'bg-[#18170F]/8 text-[#18170F]/75 hover:bg-[#18170F]/14'
+                                  } disabled:opacity-70`}
+                                >
+                                  {hasVoted ? 'Voted' : 'Vote'} ({item.votes?.length || 0})
+                                </button>
+
+                                <button
+                                  onClick={() => removeItem(item.id)}
+                                  disabled={isMutating}
+                                  className="px-2.5 py-1 rounded-full text-[11px] font-semibold bg-[#C0392B]/10 text-[#C0392B] hover:bg-[#C0392B]/16 disabled:opacity-70"
+                                >
+                                  Remove
+                                </button>
+                              </div>
+                            </article>
+                          )
+                        })}
+                      </div>
+                    </section>
+                  )
+                })}
+              </div>
+            ) : null}
+
+            {phase === 'analysis' ? (
+              <section className="mt-4 bg-white border border-[#18170F]/10 rounded-2xl p-4 shadow-sm">
+                <h3 className="text-[14px] font-semibold text-[#18170F] mb-2">Decision Analysis</h3>
+                <pre className="whitespace-pre-wrap text-[13px] text-[#18170F]/80 leading-relaxed font-body">
+                  {analysis || 'No analysis yet. Move to analysis phase after adding items.'}
+                </pre>
+              </section>
+            ) : null}
+          </section>
+
+          {showDiscussion ? (
+            <aside className="bg-white border border-[#18170F]/10 rounded-2xl p-3 sm:p-4 shadow-sm h-fit xl:sticky xl:top-4">
+              <section className="mb-4">
+                <div className="flex items-center justify-between mb-2">
+                  <h3 className="text-[13px] font-semibold text-[#18170F]">Participants</h3>
+                  <span className="text-[11px] px-2 py-0.5 rounded bg-[#18170F]/7 text-[#18170F]/65">
+                    {participantList.length}
+                  </span>
+                </div>
+
+                <div className="space-y-1.5 max-h-[120px] overflow-y-auto pr-1">
+                  {participantList.map((participant) => (
+                    <div
+                      key={participant.id}
+                      className="flex items-center justify-between px-2.5 py-1.5 rounded-lg bg-[#F8F5F1] border border-[#18170F]/6"
+                    >
+                      <span className="text-[12px] text-[#18170F] truncate">{participant.name}</span>
+                      {participant.id === String(userId) ? (
+                        <span className="text-[10px] text-[#D4420A] font-semibold uppercase tracking-wider">You</span>
+                      ) : null}
                     </div>
-                    <p className={`text-[13px] leading-relaxed p-3 rounded-lg ${
-                      msg.isSystem
-                        ? 'text-[#D4420A] font-semibold text-[11px] tracking-wider uppercase'
-                        : 'text-[#18170F]/70 bg-[#18170F]/[0.03]'
-                    }`}>
-                      {msg.text}
-                    </p>
-                  </div>
-                ))}
-              </div>
+                  ))}
+                </div>
+              </section>
 
-              {/* Chat input */}
-              <div className="p-4 border-t border-[#18170F]/6">
-                <div className="flex items-center gap-2">
+              <section>
+                <h3 className="text-[13px] font-semibold text-[#18170F] mb-2">Discussion</h3>
+
+                <div className="space-y-2 max-h-[280px] overflow-y-auto pr-1">
+                  {recentMessages.length === 0 ? (
+                    <p className="text-[12px] text-[#18170F]/55 p-3 rounded-lg bg-[#F8F5F1] border border-[#18170F]/8">
+                      Start the conversation for this decision room.
+                    </p>
+                  ) : null}
+
+                  {recentMessages.map((message, index) => (
+                    <article
+                      key={message.id || `${message.userId || 'user'}-${index}`}
+                      className="p-2.5 rounded-lg bg-[#F8F5F1] border border-[#18170F]/8"
+                    >
+                      <div className="flex items-center justify-between gap-2 mb-1">
+                        <span className="text-[11px] font-semibold text-[#18170F] truncate">
+                          {message.userName || 'Member'}
+                        </span>
+                        <span className="text-[10px] text-[#18170F]/45 shrink-0">
+                          {formatMessageTime(message.timestamp)}
+                        </span>
+                      </div>
+                      <p className="text-[12px] text-[#18170F]/78 leading-relaxed break-words">{message.text}</p>
+                    </article>
+                  ))}
+                </div>
+
+                <form onSubmit={handleSendMessage} className="mt-3 flex items-center gap-2">
                   <input
                     type="text"
-                    value={message}
-                    onChange={(e) => setMessage(e.target.value)}
-                    placeholder="Type a message..."
-                    className="flex-1 px-4 py-2 bg-[#18170F]/[0.03] rounded-lg text-sm text-[#18170F] placeholder:text-[#18170F]/25 outline-none border border-[#18170F]/6 focus:border-[#D4420A]/30"
+                    value={chatMessage}
+                    onChange={(event) => setChatMessage(event.target.value)}
+                    placeholder="Send a message"
+                    className="flex-1 px-3 py-2 rounded-lg border border-[#18170F]/15 text-[13px] text-[#18170F] placeholder:text-[#18170F]/35 focus:border-[#D4420A]/40 outline-none"
                   />
-                  <button className="p-2 text-[#D4420A] hover:bg-[#D4420A]/5 rounded-lg">
-                    <span className="material-symbols-outlined text-[20px]">send</span>
+                  <button
+                    type="submit"
+                    disabled={!chatMessage.trim()}
+                    className="px-3 py-2 rounded-lg bg-[#D4420A] text-white text-[12px] font-semibold hover:bg-[#B33508] disabled:opacity-60 disabled:cursor-not-allowed"
+                  >
+                    Send
                   </button>
-                </div>
-              </div>
-
-              {/* Settings */}
-              <div className="p-3 border-t border-[#18170F]/6">
-                <button className="flex items-center gap-2 text-[#18170F]/35 text-[13px] hover:text-[#18170F]/60 transition-colors">
-                  <span className="material-symbols-outlined text-[18px]">settings</span>
-                  Settings
-                </button>
-              </div>
-            </motion.aside>
-          )}
-        </AnimatePresence>
-      </div>
-
-      {/* ━━ Status Bar ━━ */}
-      <footer className="h-[32px] bg-[#2C2C28] px-4 sm:px-6 flex items-center justify-between text-[11px] text-[#EDE9E0]/50 shrink-0">
-        <div className="flex items-center gap-4">
-          <span className="text-[#D4420A] font-medium flex items-center gap-1">
-            <span className="w-1.5 h-1.5 rounded-full bg-[#D4420A] animate-pulse" />
-            Live Session: 42:15
-          </span>
-          <span className="hidden sm:inline">6 Participants</span>
+                </form>
+              </section>
+            </aside>
+          ) : null}
         </div>
-        <div className="hidden sm:flex items-center gap-4">
-          <span>Grid: 40px</span>
-          <span>Zoom: 100%</span>
-          <span>Autosave: Enabled</span>
-        </div>
-      </footer>
+      </main>
     </div>
   )
 }

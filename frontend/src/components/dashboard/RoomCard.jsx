@@ -39,7 +39,7 @@ const RoomCard = ({ room, index = 0 }) => {
   const isLive = room.members?.some((m) => m.status === 'active')
 
   const handleOpen = () => {
-    navigate(`/room/${room.id}`)
+    navigate(`/room/${room.publicId || room.id}`)
   }
 
   return (

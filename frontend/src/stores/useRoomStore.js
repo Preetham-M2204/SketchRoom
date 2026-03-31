@@ -1,5 +1,19 @@
 import { create } from 'zustand'
 
+function dedupeMembers(membersList = []) {
+  const byUserId = new Map()
+  membersList.forEach((member) => {
+    const userId = String(member?.userId || '')
+    if (!userId) return
+    byUserId.set(userId, {
+      ...byUserId.get(userId),
+      ...member,
+      userId,
+    })
+  })
+  return Array.from(byUserId.values())
+}
+
 const useRoomStore = create((set) => ({
   // State
   room: null,
@@ -22,10 +36,10 @@ const useRoomStore = create((set) => ({
   })),
 
   // Member actions
-  setMembers: (membersList) => set({ members: membersList }),
+  setMembers: (membersList) => set({ members: dedupeMembers(membersList) }),
 
   addMember: (member) => set((state) => ({
-    members: [...state.members, member],
+    members: dedupeMembers([...state.members, member]),
   })),
 
   removeMember: (userId) => set((state) => ({

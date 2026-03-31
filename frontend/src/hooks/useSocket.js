@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { io } from 'socket.io-client'
 import useAuthStore from '../stores/useAuthStore'
 import useRoomStore from '../stores/useRoomStore'
@@ -25,6 +25,7 @@ import { toast } from '../components/ui/Toast'
 
 const useSocket = (roomId) => {
   const socketRef = useRef(null)
+  const [socketInstance, setSocketInstance] = useState(null)
   const token = useAuthStore((state) => state.token)
   const addStroke = useRoomStore((state) => state.addStroke)
   const removeStroke = useRoomStore((state) => state.removeStroke)
@@ -33,6 +34,7 @@ const useSocket = (roomId) => {
   const setMembers = useRoomStore((state) => state.setMembers)
   const addMember = useRoomStore((state) => state.addMember)
   const removeMember = useRoomStore((state) => state.removeMember)
+  const updateMemberStatus = useRoomStore((state) => state.updateMemberStatus)
 
   useEffect(() => {
     if (!roomId || !token) return
@@ -44,6 +46,7 @@ const useSocket = (roomId) => {
     })
 
     socketRef.current = socket
+    setSocketInstance(socket)
 
     // Connection events
     socket.on('connect', () => {
@@ -77,6 +80,10 @@ const useSocket = (roomId) => {
       toast.info(`${userName} left`)
     })
 
+    socket.on('room:member-status', ({ userId, status }) => {
+      updateMemberStatus(userId, status)
+    })
+
     // Drawing events
     socket.on('draw:stroke', (stroke) => {
       addStroke(stroke)
@@ -99,10 +106,12 @@ const useSocket = (roomId) => {
     return () => {
       socket.emit('leave-room', roomId)
       socket.disconnect()
+      socketRef.current = null
+      setSocketInstance(null)
     }
-  }, [roomId, token])
+  }, [roomId, token, addStroke, removeStroke, clearStrokes, addMessage, setMembers, addMember, removeMember, updateMemberStatus])
 
-  return socketRef.current
+  return socketInstance
 }
 
 export default useSocket
